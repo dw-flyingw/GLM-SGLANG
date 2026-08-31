@@ -186,6 +186,71 @@ services:
       - --hicache-storage-backend=file
       - --hicache-storage-prefetch-policy=timeout
 
+  # Profile B: HiSparse long-context worker. GPU holds the DSA indexer at the
+  # FULL logical size (index_buf_size = size * host_to_device_ratio) while only
+  # a working set of the heavy MLA latent KV stays resident, the rest paging
+  # from host RAM. That is what raises the servable context past 512K.
+  #
+  # THE COST IS PREFIX CACHING, ENTIRELY. HiSparse asserts --disable-radix-cache,
+  # so every request re-prefills from zero. This is the wrong default for
+  # multi-turn, shared-prompt, and batch-corpus workloads alike -- hence a
+  # separate profile rather than a flag.
+  #
+  # /scratch is unused here: HiSparse has no storage backend, only GPU<->host.
+  worker-longctx:
+    <<: *worker-base
+    # Mutually exclusive with worker: SGLang forbids hierarchical cache
+    # together with --disable-radix-cache, which HiSparse requires.
+    profiles: ["longctx"]
+    environment:
+      <<: *dynamo-env
+      HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
+      HF_HUB_OFFLINE: "1"
+      # Required by the legacy nvidia runtime (see the runtime: nvidia note in
+      # x-worker-base). `gpus: all` used to carry the device request; with the
+      # runtime pinned, visibility comes from these instead. NOT inherited from
+      # x-worker-base -- environment is a whole-key replace on merge.
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    volumes:
+      - "${HF_CACHE:-/root/.cache/huggingface}:${HF_CACHE:-/root/.cache/huggingface}"
+      - "dynamo-jit-cache:/home/dynamo/.cache"
+    # SGLang engine args pass straight through. We let SGLang AUTO-SELECT the DSA
+    # attention backend (no --attention-backend): on Hopper with fp8 KV it picks
+    # flashmla_kv for prefill+decode, same as the aggregated worker. Parsers are
+    # the Dynamo-side (frontend) parsers.
+    command:
+      - --model-path=${MODEL:-zai-org/GLM-5.2-FP8}
+      - --served-model-name=${SERVED_NAME:-glm-5.2-fp8}
+      - --tp-size=${TP_SIZE:-8}
+      - --kv-cache-dtype=fp8_e4m3
+      - --max-running-requests=${MAX_RUNNING:-128}
+      - --page-size=${PAGE_SIZE:-64}
+      - --trust-remote-code
+      - --dyn-tool-call-parser=glm47
+      - --dyn-reasoning-parser=glm45
+      # HiSparse selects flashmla_kv itself for fp8_e4m3 KV -- the same backend
+      # the aggregated worker auto-selects. Do NOT add --attention-backend.
+      - --enable-hisparse
+      - --disable-radix-cache
+      - '--hisparse-config={"top_k":2048,"device_buffer_size":${HISPARSE_DEVICE_BUFFER:-4096},"host_to_device_ratio":${HISPARSE_RATIO:-2}}'
+      # Measured 2026-08-31: Profile A at --mem-fraction-static 0.85 reported
+      # available_gpu_mem=10.09 GB/GPU. Raising to 0.88 consumes ~4.3 GB more of
+      # that headroom, leaving ~5.8 GB -- feasible but tight; that is what lets
+      # the full 1,048,576-token context be addressed. dynamo/README.md warns
+      # that ~0.93 risks OOM at CUDA-graph capture, so 0.88 is not pushed further.
+      - --context-length=${MAX_MODEL_LEN_LONG:-1048576}
+      - --mem-fraction-static=${MEM_FRACTION_LONG:-0.88}
+      # MTP/EAGLE is carried over UNVERIFIED: nothing in SGLang forbids it with
+      # HiSparse and nothing exercises it either. If startup fails citing
+      # speculative decoding, delete these four lines and re-run -- Profile B
+      # then loses the ~2x single-stream decode MTP provides, which must be
+      # recorded in RESULTS-kv-tiering.md.
+      - --speculative-algorithm=${SPEC_ALGO:-EAGLE}
+      - --speculative-num-steps=${SPEC_NUM_STEPS:-2}
+      - --speculative-eagle-topk=${SPEC_EAGLE_TOPK:-1}
+      - --speculative-num-draft-tokens=${SPEC_NUM_DRAFT:-3}
+
 volumes:
   etcd-data:
   dynamo-jit-cache:   # persisted JIT kernel cache (fast worker restarts)

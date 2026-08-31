@@ -137,32 +137,37 @@ def test_filenotfounderror_does_not_over_evict(kv_reaper, tmp_path, monkeypatch)
     assert (root / "newest.bin").exists(), "newest.bin must survive"
 
 
-def test_oserror_does_not_credit_undeletable_files(kv_reaper, tmp_path, monkeypatch):
-    """OSError: file cannot be deleted, it still counts toward budget.
+def test_undeletable_file_still_counts_against_the_budget(kv_reaper, tmp_path, monkeypatch):
+    """OSError: undeletable file counts toward budget, forcing deeper deletion.
 
-    Create two files. Make one undeletable (PermissionError). Reap with a
-    tight budget. Assert that the undeletable file is NOT reported as
-    reclaimed and the file survives.
+    Four 100-byte files (f0..f3) with budget 150: need to free 250 bytes (3 files).
+    Make f0 (oldest) undeletable via PermissionError. Correct behaviour: f0 fails
+    and stays in total=400, so loop must delete f1, f2, f3 to reach 100.
+    Result: reap(...) == (3, 300), f0 survives, f3 is gone.
+
+    Regression to catch: if OSError wrongly decremented total, loop would stop
+    at 2 deletions (f1, f2 only), f3 would survive, and reap would return (2, 200).
     """
     root = tmp_path / "scratch" / "kvcache"
-    _write(root / "locked.bin", 100, 1000)
-    _write(root / "free.bin", 100, 2000)
+    _write(root / "f0.bin", 100, 1000)  # oldest, undeletable
+    _write(root / "f1.bin", 100, 2000)
+    _write(root / "f2.bin", 100, 3000)
+    _write(root / "f3.bin", 100, 4000)  # newest
 
-    # Monkeypatch unlink to raise PermissionError for locked.bin
+    # Monkeypatch unlink to raise PermissionError for f0.bin
     original_unlink = pathlib.Path.unlink
 
     def patched_unlink(self):
-        if self.name == "locked.bin":
+        if self.name == "f0.bin":
             raise PermissionError("cannot delete")
         return original_unlink(self)
 
     monkeypatch.setattr(pathlib.Path, "unlink", patched_unlink)
 
-    removed, reclaimed = kv_reaper.reap(root, max_bytes=50)
-    # locked.bin cannot be deleted, so it still counts toward the budget.
-    # We can only delete free.bin (100 bytes), leaving 200 bytes total.
-    # This still exceeds budget, but we can't do better.
-    assert removed == 1, "should only count the one file we successfully deleted"
-    assert reclaimed == 100, "should only credit what we actually deleted"
-    assert (root / "locked.bin").exists(), "locked.bin must survive (undeletable)"
-    assert not (root / "free.bin").exists(), "free.bin should be deleted"
+    removed, reclaimed = kv_reaper.reap(root, max_bytes=150)
+    # f0 is undeletable and still counts toward total=400.
+    # Need 250 bytes freed: deletes f1, f2, f3 to reach 100.
+    assert removed == 3, "must delete 3 files to offset the uncounted one"
+    assert reclaimed == 300, "must reclaim 300 bytes (3 * 100)"
+    assert (root / "f0.bin").exists(), "undeletable f0 must survive"
+    assert not (root / "f3.bin").exists(), "even newest file f3 must be deleted to compensate"

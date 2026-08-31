@@ -946,3 +946,142 @@ $ du -sh /scratch/kvcache/glm52; find /scratch/kvcache/glm52 -type f | wc -l   #
 Since the measurement above recommends against `write_through_selective` as the default, the stack was restarted one final time after the eviction-pressure sequence completed, back onto the default (`write_through`, no `HICACHE_WRITE_POLICY` override). The worker's `ServerArgs` log line was re-checked and confirms `hicache_write_policy='write_through'`. The stack is UP, serving on `PROFILE=cache` with `write_through`, matching the state at the start of this task (the same known-good policy this evaluation validates as the correct default).
 
 (Both restarts in this task hit the same operational snag on `./stop.sh`: `dynamo-worker-1` came back "PID ... is zombie and can not be killed" on the normal `docker compose down`. Resolved both times with `docker kill dynamo-worker-1`, which exited the container cleanly within ~4s, after which `./stop.sh` completed teardown normally. Recorded here since it recurred; not benchmark-relevant.)
+
+## Restart persistence (L3 survival)
+
+**The question:** host RAM (L2) is wiped on every worker restart. Only `/scratch` (L3) survives. If a cached prefix does not come back from `/scratch` after a restart, the disk tier contributes nothing that L2-only would not, and it should be dropped. This test used a **fresh seed (4242)** never touched by any prior task, so no pre-existing cache state could confound the result.
+
+### Step 1 — cache state before the experiment
+
+```
+$ du -sh /scratch/kvcache/glm52
+47G	/scratch/kvcache/glm52
+$ find /scratch/kvcache/glm52 -type f | wc -l
+38070
+```
+
+### Step 2 — prime seed 4242 (expect cold; confirms the seed was genuinely unused)
+
+```
+$ ./bench_stream.py --shared-prefix-tokens 131072 --prefix-seed 4242 --num 1 --concurrency 1 --max-tokens 32 --tag persist-prime
+shared prefix: ~131072 tokens, seed 4242, 904606 chars
+
+=== bench persist-prime pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 20.93 s
+TTFT  mean/p50/p99  : 20523 / 20523 / 20523 ms
+ITL   mean/p50/p99  : 31.1 / 19.9 / 60.6 ms
+per-req decode tok/s: mean 76.5  (min 76.5, max 76.5)
+prompt tokens mean  : 135257
+output tokens total : 32
+system output tok/s : 1.5
+```
+
+No `cached tokens mean` line — genuinely cold, as expected. Seed 4242 was not previously cached; the experiment is valid.
+
+### Step 3 — confirm warm (GPU/L2 hit before any restart)
+
+```
+$ ./bench_stream.py --shared-prefix-tokens 131072 --prefix-seed 4242 --num 1 --concurrency 1 --max-tokens 32 --tag persist-warm
+shared prefix: ~131072 tokens, seed 4242, 904606 chars
+
+=== bench persist-warm pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 0.99 s
+TTFT  mean/p50/p99  : 754 / 754 / 754 ms
+ITL   mean/p50/p99  : 17.3 / 17.7 / 19.2 ms
+per-req decode tok/s: mean 136.5  (min 136.5, max 136.5)
+prompt tokens mean  : 135257
+cached tokens mean  : 135232 (100.0% of prompt)
+output tokens total : 32
+system output tok/s : 32.4
+```
+
+### `/scratch` size after priming (before restart)
+
+```
+$ du -sh /scratch/kvcache/glm52
+55G	/scratch/kvcache/glm52
+$ find /scratch/kvcache/glm52 -type f | wc -l
+44409
+```
+
+Grew from 47 GB / 38070 files to 55 GB / 44409 files — seed 4242's pages were written through to `/scratch`, as expected under `write_through`.
+
+### Step 4 — restart the worker, preserving `/scratch`
+
+```
+$ docker kill dynamo-worker-1
+Error response from daemon: cannot kill container: dynamo-worker-1: container 64c65a8ea06f PID 2587255 is zombie and can not be killed. Use the --init option when creating containers to run an init inside the container that forwards signals and reaps processes
+$ ./stop.sh
+ Container dynamo-worker-1 Stopping
+ Container dynamo-frontend-1 Stopping
+ ...
+Dynamo stack stopped.
+$ PROFILE=cache ./serve.sh
+```
+
+(This is the same known `./stop.sh` "zombie PID" snag documented earlier in this file — cosmetic on `docker kill`, teardown still completed cleanly.) `/scratch/kvcache/glm52` was **not** touched — no volume flags, no deletion.
+
+Model re-registered after ~180 s:
+```
+$ curl -s --noproxy 127.0.0.1 http://127.0.0.1:8000/v1/models
+{"object":"list","data":[{"id":"glm-5.2-fp8","object":"model","created":1788203337,"owned_by":"nvidia","context_window":524288}]}
+```
+
+**L2 (host RAM) confirmed rebuilt fresh and empty** — 8 allocations (one per TP rank), all timestamped from this boot:
+```
+$ docker compose --profile cache logs worker 2>&1 | grep -c "Allocating 96.00 GB host memory for hierarchical KV cache"
+8
+$ docker compose --profile cache logs worker 2>&1 | grep "Allocating 96.00 GB host memory for hierarchical KV cache"
+worker-1  | ... INFO memory_pool_host.__init__: Allocating 96.00 GB host memory for hierarchical KV cache.
+   (x8, all at 2026-08-31T19:08:09.66x-19:08:09.72x — this boot only)
+```
+Server config also reconfirmed unchanged: `hicache_write_policy='write_through'`, `hicache_storage_backend='file'`.
+
+### Step 5 — THE MEASUREMENT: re-request the identical seed-4242 prefix after restart
+
+```
+$ ./bench_stream.py --shared-prefix-tokens 131072 --prefix-seed 4242 --num 1 --concurrency 1 --max-tokens 32 --tag persist-after-restart
+shared prefix: ~131072 tokens, seed 4242, 904606 chars
+
+=== bench persist-after-restart pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 5.37 s
+TTFT  mean/p50/p99  : 5121 / 5121 / 5121 ms
+ITL   mean/p50/p99  : 18.7 / 17.8 / 27.9 ms
+per-req decode tok/s: mean 127.4  (min 127.4, max 127.4)
+prompt tokens mean  : 135257
+cached tokens mean  : 135232 (100.0% of prompt)
+output tokens total : 32
+system output tok/s : 6.0
+```
+
+### `/scratch` size after the restart measurement
+
+```
+$ du -sh /scratch/kvcache/glm52
+55G	/scratch/kvcache/glm52
+$ find /scratch/kvcache/glm52 -type f | wc -l
+44409
+```
+
+Unchanged from the pre-restart figure (no new writes needed — the read came from existing L3 content, and file count/size stayed flat because the request read from disk rather than adding to it).
+
+### Side-by-side: prime (cold) / warm (pre-restart) / after-restart
+
+| Pass | TTFT (mean) | Cached tokens | Cached % |
+|---|---:|---:|---:|
+| persist-prime (cold, fresh seed) | 20523 ms | — (no cached-tokens line) | 0% |
+| persist-warm (pre-restart, GPU/L2) | 754 ms | 135232 / 135257 | 100.0% |
+| persist-after-restart (post L2-wipe) | 5121 ms | 135232 / 135257 | **100.0%** |
+
+### Verdict
+
+**L3 persistence CONFIRMED.** Cached-token percentage is the direct read, and it is unambiguous: **100.0% of the prompt was served from cache after a full worker restart that wiped host RAM (L2 freshly reallocated, 8×96 GB, confirmed empty at boot)**. The only place those 135,232 tokens could have come from is `/scratch/kvcache/glm52`, which was untouched across the restart and stood at 55 GB / 44,409 files throughout.
+
+TTFT after restart (5121 ms) sits between cold (20523 ms) and pre-restart-warm (754 ms) — about 4x faster than cold, but ~6.8x slower than an in-RAM (L2) hit. This is the expected shape of an L3 (NVMe) hit: slower than RAM because pages must be read from disk and copied back into the GPU/L2 pools, but categorically faster than recomputing the full 131K-token prefill from scratch. The **cached-token count**, not TTFT, is the decisive metric per the task's own instruction, and it reads 100.0% — a clean, unambiguous hit.
+
+**Conclusion: `/scratch` earns its place.** This is the one claim host RAM alone cannot make — L2 is gone on every restart, and disk is what carried the 131K-token prefix through it. The tiered design (GPU → host RAM → `/scratch` NVMe) is justified by this result: L3 is not redundant with L2, it is what makes cache survival possible across a restart at all.
+
+The stack was left UP and serving on `write_through` after this test (unchanged from state at test start); no further restart was performed after the measurement.

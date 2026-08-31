@@ -427,3 +427,337 @@ the next reboot (/run is tmpfs). The `runtime: nvidia` pin in docker-compose.yml
 workaround and should be reverted to `gpus: all` once the host is repaired.
 
 After the repair the worker started, loaded, and registered normally. Benchmarks follow below.
+
+---
+
+## Profile A measurements (2026-08-31, post-repair)
+
+Continuation of the same task, same day, after the driver fault above was fixed. This run picks up an **already-running** stack — per this task's instructions, Step 1 (restart under `PROFILE=cache`) had already been performed by the operator before this measurement pass began; no `stop.sh`/`serve.sh` was run here. Stack state confirmed at start:
+
+```
+$ docker compose --profile cache ps
+NAME                IMAGE                             COMMAND                  SERVICE    CREATED          STATUS          PORTS
+dynamo-etcd-1       quay.io/coreos/etcd:v3.5.21       "etcd --data-dir=/et…"   etcd       28 minutes ago   Up 28 minutes
+dynamo-frontend-1   glm52-dynamo-sglang:0.5.13post1   "python3 -m dynamo.f…"   frontend   28 minutes ago   Up 28 minutes
+dynamo-nats-1       nats:2.10-alpine                  "docker-entrypoint.s…"   nats       28 minutes ago   Up 28 minutes
+dynamo-worker-1     glm52-dynamo-sglang:0.5.13post1   "python3 -m dynamo.s…"   worker     5 minutes ago    Up 5 minutes
+
+$ curl -s http://localhost:8000/v1/models
+{"object":"list","data":[{"id":"glm-5.2-fp8","object":"model","created":1788199725,"owned_by":"nvidia","context_window":524288}]}
+```
+
+Worker is up and registered. Already independently confirmed (not re-derived here): 8x `Allocating 96.00 GB host memory for hierarchical KV cache.` (one per TP rank), `max_total_num_tokens=540928` (baseline was 540800 — did not shrink), MTP draft CUDA graph captured, host RAM 972 GB in use.
+
+### Step 2: effective configuration from the log
+
+Command:
+
+```bash
+docker compose logs worker 2>&1 | grep -iE "hicache|hierarchical|host memory|indexer|max_total_num_tokens|attention backend" | grep -v "ServerArgs(" | head -30
+```
+
+Output (verbatim, representative lines; the 8x-per-rank `Allocating 96.00 GB` and `19.32 GB` lines are deduplicated to one each below for readability, all 8 confirmed present in the raw log):
+
+```
+worker-1  | 2026-08-31T18:03:04.548251Z  INFO server_args._handle_model_specific_adjustments: Use dsa attention backend for DeepSeek with DSA.
+worker-1  | 2026-08-31T18:05:32.831330Z  INFO memory_pool_host.__init__: Allocating 96.00 GB host memory for hierarchical KV cache.   [x8, one per TP rank]
+worker-1  | 2026-08-31T18:05:32.855360Z  INFO scheduler.init_model_worker: max_total_num_tokens=540928, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=128, context_len=524288, available_gpu_mem=10.09 GB
+worker-1  | 2026-08-31T18:05:57.196364Z  WARN hicache.can_use_hicache_jit_kernel: Unsupported element_size = 656 for JIT HiCache kernel   [x8]
+worker-1  | 2026-08-31T18:05:57.197020Z  INFO memory_pool_host.__init__: Allocating 19.32 GB host memory for DSA indexer (layout=page_first).   [x8, one per TP rank]
+worker-1  | 2026-08-31T18:06:02.243745Z  INFO backend_factory.create_backend: Creating storage backend 'file' (sglang.srt.mem_cache.hicache_storage.HiCacheFile)   [x8]
+worker-1  | 2026-08-31T18:06:02.697455Z  INFO hybrid_pool_assembler.attach_hybrid_dsa_pool_to_hiradix_cache: Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, transfer_layer_num=78   [x8]
+worker-1  | 2026-08-31T18:06:03.701249Z  INFO memory_pool_host.__init__: Allocating 1.08 GB host memory for hierarchical KV cache.   [x8, additional small pool — appears to be the MTP draft-model host cache, separate from the 96 GB main-model pool above]
+```
+
+`grep -oE` isolation of the two exact-value assertions from the full `ServerArgs(...)` dump:
+
+```
+$ docker compose logs worker 2>&1 | grep -oE "hicache_mem_layout='?[a-zA-Z_]+'?" | sort -u
+hicache_mem_layout='page_first'
+
+$ docker compose logs worker 2>&1 | grep -oE "hicache_io_backend='?[a-zA-Z_]+'?" | sort -u
+hicache_io_backend='kernel'
+```
+
+Attention backend, from `_handle_model_specific_adjustments` and `_set_default_dsa_backends`:
+
+```
+worker-1  | 2026-08-31T18:03:04.548251Z  INFO server_args._handle_model_specific_adjustments: Use dsa attention backend for DeepSeek with DSA.
+worker-1  | 2026-08-31T18:03:04.548935Z  WARN server_args._set_default_dsa_backends: Set DSA backends for fp8_e4m3 KV Cache: prefill=flashmla_kv, decode=flashmla_kv.
+```
+
+#### Step 2 assertions — actual vs expected
+
+| Assertion | Expected | Actual | Verdict |
+|---|---|---|---|
+| Hierarchical KV cache host alloc per rank | ~96 GB | **96.00 GB** x8 | PASS, exact match |
+| DSA indexer host alloc per rank | ~22 GB | **19.32 GB** x8 | **DIFFERS from expected** — 19.32 GB actual vs. ~22 GB expected in the brief (12% lower). Not a failure of the config (the value is internally consistent and repeats identically across all 8 ranks), but the *plan's* estimate of indexer size was off; recorded here so downstream reasoning about total host-memory budget uses the real number, not the estimate. |
+| `hicache_mem_layout` | `page_first` | **`page_first`** | PASS — not silently rewritten |
+| `hicache_io_backend` | `kernel` | **`kernel`** | PASS — not downgraded to `direct` |
+| `max_total_num_tokens` | not shrunk from 540800 | **540928** | PASS — device pool did not shrink (actually 128 tokens larger than the plain-baseline run; within normal run-to-run noise from `available_gpu_mem`, not a meaningful change) |
+| Attention backend | auto DSA / `flashmla_kv` | **DSA backend, `dsa_prefill_backend=flashmla_kv`, `dsa_decode_backend=flashmla_kv`** | PASS |
+
+One additional log line worth flagging, not asked for in Step 2 but relevant to interpreting the io_backend result: `WARN hicache.can_use_hicache_jit_kernel: Unsupported element_size = 656 for JIT HiCache kernel`, repeated once per rank right before the indexer allocations. This means the JIT-optimized hicache kernel path is unavailable for this element size and the `kernel` io_backend is falling back to a non-JIT (presumably more generic/copy-based) implementation — `kernel` itself was *not* downgraded to `direct` (confirmed above), but it is not running the fastest available `kernel`-mode code path either. This may be a contributing factor in the conc-32 throughput regression measured below.
+
+### Step 3: host memory and /scratch state
+
+```
+$ free -g
+               total        used        free      shared  buff/cache   available
+Mem:            2267         961         590         868        1594        1306
+
+$ ls -la /scratch/kvcache/glm52
+total 0
+drwxrwxrwx 2 wrightda wrightda  6 Aug 31 18:02 .
+drwxr-xr-x 3 wrightda wrightda 19 Aug 31 16:51 ..
+
+$ du -sh /scratch/kvcache/glm52   # BEFORE benchmarks
+0	/scratch/kvcache/glm52
+```
+
+961 GB used, in line with the ~944 GB expected over baseline (8x96 GB hierarchical + 8x19.32 GB indexer + 8x1.08 GB MTP-draft ≈ 933 GB of hicache host pools alone, plus normal process/model overhead). `/scratch/kvcache/glm52` exists, mode `0777`, empty before any benchmark traffic — matches "may be empty until first requests run."
+
+### Step 4: three benchmarks (verbatim)
+
+#### hicache-latency (concurrency 1, num 16, max-tokens 256)
+
+```
+=== bench hicache-latency pass 1/1  conc=1 num=16 max_tokens=256 ===
+requests ok/err     : 16/0
+wall time           : 32.64 s
+TTFT  mean/p50/p99  : 337 / 150 / 2926 ms
+ITL   mean/p50/p99  : 16.3 / 16.2 / 18.0 ms
+per-req decode tok/s: mean 149.8  (min 146.4, max 150.1)
+prompt tokens mean  : 67
+cached tokens mean  : 64 (95.5% of prompt)
+output tokens total : 4096
+system output tok/s : 125.5
+```
+
+conc-1 mean decode tok/s: **149.8** vs Task 3 measured baseline **150.6** → -0.53%, well within the 5% tolerance. **PASS.**
+
+#### hicache-throughput (concurrency 32, num 128, max-tokens 256)
+
+```
+=== bench hicache-throughput pass 1/1  conc=32 num=128 max_tokens=256 ===
+requests ok/err     : 128/0
+wall time           : 17.20 s
+TTFT  mean/p50/p99  : 862 / 429 / 2208 ms
+ITL   mean/p50/p99  : 31.7 / 30.5 / 47.9 ms
+per-req decode tok/s: mean 75.1  (min 64.4, max 84.3)
+prompt tokens mean  : 67
+cached tokens mean  : 64 (95.5% of prompt)
+output tokens total : 32768
+system output tok/s : 1905.2
+```
+
+conc-32 system tok/s: **1905.2** vs Task 3 measured baseline **2087.1** → **-8.72%, outside the 5% tolerance. FAIL.**
+
+Per the brief, the prescribed next step on a cold-path regression is to retry with `--hicache-write-policy=write_through_selective`. **This was not attempted.** Changing that flag requires restarting the worker with different server args, and this task's operational rules explicitly say: "Do NOT restart, stop, or reconfigure the stack. If you believe a restart is needed, STOP and report rather than doing it." The regression is recorded as-is, unretried, per that instruction — this is a live production endpoint serving users through a gateway on another host, and a config-flag retry was judged out of scope for this measurement pass. A follow-up task with authorization to restart the worker should try `write_through_selective` and re-measure.
+
+#### hicache-prefix (concurrency 1, num 1, passes 2, shared-prefix-tokens 131072, max-tokens 32)
+
+Not a pass/fail criterion per the brief ("Warm-prefix TTFT is NOT a criterion") — recorded for completeness.
+
+```
+shared prefix: ~131072 tokens, seed 1234, 905297 chars
+
+=== bench hicache-prefix pass 1/2  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 18.76 s
+TTFT  mean/p50/p99  : 18408 / 18408 / 18408 ms
+ITL   mean/p50/p99  : 31.8 / 29.6 / 49.0 ms
+per-req decode tok/s: mean 88.6  (min 88.6, max 88.6)
+prompt tokens mean  : 135271
+output tokens total : 32
+system output tok/s : 1.7
+
+=== bench hicache-prefix pass 2/2  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 0.93 s
+TTFT  mean/p50/p99  : 685 / 685 / 685 ms
+ITL   mean/p50/p99  : 18.2 / 18.1 / 20.7 ms
+per-req decode tok/s: mean 131.1  (min 131.1, max 131.1)
+prompt tokens mean  : 135271
+cached tokens mean  : 135168 (99.9% of prompt)
+output tokens total : 32
+system output tok/s : 34.6
+
+=== TTFT by pass (mean ms) ===
+pass 1: 18408
+pass 2: 685
+pass1/pass2 speedup : 26.87x
+```
+
+Pass 1 TTFT (18408 ms) is slower than the plain-radix baseline's pass 1 (16677 ms) — the first-ever write of a 131072-token prefix through hicache's write-through path to L2/L3 costs more than a plain radix-only cold prefill, as expected (extra I/O on the write side). This is consistent with the conc-32 regression above: hicache write-through overhead is real and visible on this host, not a one-off measurement blip.
+
+### Step 4b: eviction-pressure sequence (the decisive test)
+
+Note: the prime step below was **not** genuinely cold, unlike the Task 3b plain-radix baseline — it landed 0.87 s / 100% cached, because the immediately-preceding `hicache-prefix` benchmark (previous section) had just written this exact seed-1234 prefix. That benchmark's pass 1 is therefore the true cold-write reference for this prefix (18408 ms, see above).
+
+#### evict-hicache-prime (seed 1234)
+
+```
+shared prefix: ~131072 tokens, seed 1234, 905297 chars
+
+=== bench evict-hicache-prime pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 0.87 s
+TTFT  mean/p50/p99  : 669 / 669 / 669 ms
+ITL   mean/p50/p99  : 18.0 / 17.7 / 23.0 ms
+per-req decode tok/s: mean 156.4  (min 156.4, max 156.4)
+prompt tokens mean  : 135271
+cached tokens mean  : 135232 (100.0% of prompt)
+output tokens total : 32
+system output tok/s : 36.7
+```
+
+#### evict-hicache-warm (seed 1234, confirms resident before flood)
+
+```
+shared prefix: ~131072 tokens, seed 1234, 905297 chars
+
+=== bench evict-hicache-warm pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 0.85 s
+TTFT  mean/p50/p99  : 648 / 648 / 648 ms
+ITL   mean/p50/p99  : 17.8 / 17.7 / 21.2 ms
+per-req decode tok/s: mean 158.3  (min 158.3, max 158.3)
+prompt tokens mean  : 135271
+cached tokens mean  : 135232 (100.0% of prompt)
+output tokens total : 32
+system output tok/s : 37.7
+```
+
+#### flood with 5 distinct prefixes (seeds 2-6), 655,360 tokens total
+
+```
+===== SEED 2 =====
+shared prefix: ~131072 tokens, seed 2, 905409 chars
+
+=== bench evict-hicache-flood-seed2 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.09 s
+TTFT  mean/p50/p99  : 16729 / 16729 / 16729 ms
+ITL   mean/p50/p99  : 32.0 / 27.5 / 50.6 ms
+per-req decode tok/s: mean 87.9  (min 87.9, max 87.9)
+prompt tokens mean  : 135150
+output tokens total : 32
+system output tok/s : 1.9
+
+===== SEED 3 =====
+shared prefix: ~131072 tokens, seed 3, 905248 chars
+
+=== bench evict-hicache-flood-seed3 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.09 s
+TTFT  mean/p50/p99  : 16735 / 16735 / 16735 ms
+ITL   mean/p50/p99  : 32.0 / 30.5 / 49.0 ms
+per-req decode tok/s: mean 88.0  (min 88.0, max 88.0)
+prompt tokens mean  : 135151
+output tokens total : 32
+system output tok/s : 1.9
+
+===== SEED 4 =====
+shared prefix: ~131072 tokens, seed 4, 904689 chars
+
+=== bench evict-hicache-flood-seed4 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.16 s
+TTFT  mean/p50/p99  : 16779 / 16779 / 16779 ms
+ITL   mean/p50/p99  : 31.1 / 25.7 / 51.5 ms
+per-req decode tok/s: mean 83.0  (min 83.0, max 83.0)
+prompt tokens mean  : 135164
+output tokens total : 32
+system output tok/s : 1.9
+
+===== SEED 5 =====
+shared prefix: ~131072 tokens, seed 5, 905176 chars
+
+=== bench evict-hicache-flood-seed5 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.21 s
+TTFT  mean/p50/p99  : 16852 / 16852 / 16852 ms
+ITL   mean/p50/p99  : 32.2 / 26.1 / 51.9 ms
+per-req decode tok/s: mean 87.4  (min 87.4, max 87.4)
+prompt tokens mean  : 135278
+output tokens total : 32
+system output tok/s : 1.9
+
+===== SEED 6 =====
+shared prefix: ~131072 tokens, seed 6, 905114 chars
+
+=== bench evict-hicache-flood-seed6 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.23 s
+TTFT  mean/p50/p99  : 16852 / 16852 / 16852 ms
+ITL   mean/p50/p99  : 30.7 / 27.4 / 49.3 ms
+per-req decode tok/s: mean 84.0  (min 84.0, max 84.0)
+prompt tokens mean  : 135255
+output tokens total : 32
+system output tok/s : 1.9
+```
+
+All five flood requests were genuinely cold (no `cached tokens mean` line, TTFT 16729-16852 ms) — same order of magnitude as the plain-radix baseline's flood (16641-16841 ms), confirming each seed hit fresh, uncached content and pushed the GPU radix pool to evict prefix A (seed 1234) exactly as in Task 3b.
+
+#### evict-hicache-recheck (seed 1234) — THE DECISIVE MEASUREMENT
+
+```
+shared prefix: ~131072 tokens, seed 1234, 905297 chars
+
+=== bench evict-hicache-recheck pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 1.43 s
+TTFT  mean/p50/p99  : 1230 / 1230 / 1230 ms
+ITL   mean/p50/p99  : 17.6 / 17.6 / 21.7 ms
+per-req decode tok/s: mean 160.0  (min 160.0, max 160.0)
+prompt tokens mean  : 135271
+cached tokens mean  : 135232 (100.0% of prompt)
+output tokens total : 32
+system output tok/s : 22.4
+```
+
+**Cached tokens mean: 135232 / 135271 = 100.0% of prompt — non-zero, in fact fully cached.** This is direct, unambiguous proof the evicted prefix was served from L2 (host RAM) or L3 (`/scratch`) rather than recomputed from scratch. TTFT corroborates: 1230 ms vs. the Task 3b baseline's 16769 ms at the identical point in an identical sequence — a 13.6x reduction, landing much closer to the warm-GPU-radix numbers (648-685 ms in this same run) than to the baseline's cold-recompute number.
+
+**This is the opposite of the "tiering does nothing" failure case described in the brief.** The recheck is not ~16.8 s at 0% cached — it is 1230 ms at 100% cached. The tiering worked exactly as designed for this test.
+
+### `/scratch` growth and write-amplification check
+
+```
+$ du -sh /scratch/kvcache/glm52   # AFTER all Step 4 + Step 4b benchmarks
+48G	/scratch/kvcache/glm52
+
+$ find /scratch/kvcache/glm52 -type f | wc -l
+38106
+```
+
+`/scratch` grew from **0 bytes / 0 files (before) to 48 GB / 38106 files (after)** — the L3 tier is unambiguously being written, not sitting idle. Combined with the 100%-cached, 1230 ms recheck above, this also resolves which of the two possible failure modes would have applied had the tiering not worked: this is the "grows AND recheck is warm" case (tier written, and read back successfully), not "grows but recheck stays cold" (written but not read back), and definitely not "never grows at all" (not written).
+
+File naming has no `tp_rank` suffix (`<hash>_glm-5.2-fp8.bin`, `<hash>.indexer_glm-5.2-fp8.bin`, `<hash>.draft_glm-5.2-fp8.bin` — 3 files per page-key), consistent with the brief's expectation that MLA uses one deduped storage key per page shared across all 8 TP ranks. File count / 3 = 12702 unique page-keys; at page_size=64 that covers 812,928 tokens, in the right order of magnitude for the unique (non-cache-hit) token volume actually pushed through this session (the 5-seed flood alone is 655,360 tokens of genuinely new content, plus the hicache-prefix pass-1 cold write of 131,072 tokens, plus smaller amounts from the latency/throughput runs). This is evidence *against* gross 8x storage bloat from uncoordinated per-rank writes — if all 8 ranks were writing independent copies under distinct keys, file count and total bytes would be roughly 8x higher for the same unique-token volume.
+
+**Caveat:** this is a size/file-count inference, not a direct I/O measurement. The brief asked to "sample `iostat -x 5 3`" specifically *during* the conc-32 run; that was not done live (the check was designed in retrospect, after the conc-32 run had already completed, per the instruction not to re-run benchmarks chasing better numbers). It's possible all 8 ranks are still each independently issuing a write syscall to the *same* file/key (redundant I/O that wouldn't show up in `du -sh` or file count, only in `iostat`'s write-ops rate). Given the conc-32 throughput regression already measured above (-8.72%), redundant same-key writes across ranks is a plausible contributing cause and should be checked directly with `iostat` in a follow-up run authorized to hold the endpoint under synthetic load again.
+
+### Step 5/6: PASS/FAIL against the spec's criteria
+
+| Criterion | Baseline | Profile A measured | Threshold | Verdict |
+|---|---:|---:|---|---|
+| conc-1 decode tok/s (no cold-path regression) | 150.6 | **149.8** | within 5% (≥143.07) | **PASS** (-0.53%) |
+| conc-32 system tok/s (no cold-path regression) | 2087.1 | **1905.2** | within 5% (≥1982.75) | **FAIL** (-8.72%) |
+| Eviction survival — cached tokens on recheck (decisive) | 0 (0%) | **135232 (100.0%)** | non-zero | **PASS** |
+| Eviction survival — TTFT on recheck (corroboration) | 16769 ms | **1230 ms** | substantially lower | **PASS** (13.6x lower) |
+| `/scratch` grows (L3 tier written) | 0 bytes | **48 GB, 38106 files** | non-empty after traffic | **PASS** |
+| Write-amplification check (dedup key, no ~8x bloat) | n/a | file/size math consistent with 1x, not verified live via `iostat` | no ~8x growth vs unique-token rate | **PASS (inferred), unverified by direct I/O sampling** |
+| `hicache_mem_layout` unchanged | `page_first` | `page_first` | must not be rewritten | **PASS** |
+| `hicache_io_backend` unchanged | `kernel` | `kernel` | must not be downgraded to `direct` | **PASS** |
+| `max_total_num_tokens` not shrunk | 540800 | 540928 | ≥540800 | **PASS** |
+| Attention backend unchanged | DSA / `flashmla_kv` | DSA / `flashmla_kv` | must remain auto-selected DSA | **PASS** |
+| Hierarchical KV host alloc ≈96 GB/rank | — | 96.00 GB x8 | ~96 GB | **PASS** |
+| DSA indexer host alloc ≈22 GB/rank | — | 19.32 GB x8 | ~22 GB (brief's estimate) | **DIFFERS from plan estimate (19.32 vs ~22 GB) — not a pass/fail item per se, recorded prominently as instructed** |
+
+### Overall judgement
+
+**The decisive criterion — eviction survival — is a clear, unambiguous PASS.** A 131K-token prefix, fully evicted from the 540,928-token GPU radix pool by a 655,360-token flood, came back at 100.0% cached tokens and 1230 ms TTFT instead of the baseline's 0% cached / 16,769 ms. This is direct proof (via `usage.prompt_tokens_details.cached_tokens`, not just TTFT) that L2/L3 tiering is doing real, working prefix recovery. Leading with the cached-token number as instructed: **135232/135271 (100.0%) is the headline result, and it is unambiguously positive** — this is not the "tiering does nothing" outcome, and there is no need to soften or hedge that finding.
+
+**However, the cold-path-regression criterion is a genuine, measured FAIL at conc-32** (1905.2 vs 2087.1 tok/s, -8.72%, outside the 5% tolerance), while conc-1 passes comfortably (-0.53%). Tiering is not "free when it misses" under concurrent load on this host as currently configured — write-through overhead is visible both in the conc-32 throughput drop and in the elevated cold-write TTFT for the hicache-prefix benchmark's pass 1 (18408 ms vs. the plain-radix baseline's 16677 ms for an equivalent cold prefill). The brief's suggested mitigation (`--hicache-write-policy=write_through_selective`) requires a worker restart, which was out of scope for this measurement pass per explicit operational instructions to not restart the live, user-serving endpoint. **This regression should not be dismissed** — it is the one criterion this run does not pass, and it should be re-tested with `write_through_selective` (or another write-policy tuning) in a follow-up task that has authorization to restart the worker.
+
+The stack was left running and untouched throughout (no `stop.sh`/`serve.sh`/`docker compose restart` at any point in this measurement pass); it remains UP and serving on `PROFILE=cache` after this task.

@@ -297,7 +297,7 @@ The worker's tiered KV cache (`--hicache-storage-backend=file`, `KV_SCRATCH_DIR`
 writing to `/scratch/kvcache/glm52`) has **no eviction and no size cap** — SGLang's
 `file` backend just keeps writing one `.bin` per page component forever. Left alone
 it grows without bound until the 28 TB `/scratch` volume fills and the worker starts
-failing writes. `dynamo/kv_reaper.py` (19 tests) enforces a byte budget on
+failing writes. `dynamo/kv_reaper.py` (20 tests) enforces a byte budget on
 that directory, deleting the oldest files first until the tree fits.
 
 **Schedule** — a user crontab entry, no sudo required (the invoking user owns

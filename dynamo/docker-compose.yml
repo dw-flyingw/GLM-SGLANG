@@ -31,6 +31,14 @@ x-worker-base: &worker-base
   network_mode: host
   gpus: all
   ipc: host
+  # The image runs the worker directly as pid 1, with no init to reap children.
+  # On SIGTERM the engine cleans up but pid 1 lingers as a zombie, so docker
+  # SIGKILLs it at the stop timeout (exit 137) -- which makes `./stop.sh` report
+  # "PID ... is zombie and can not be killed" and makes `docker restart` fail
+  # outright, leaving the worker DOWN rather than restarted (verified
+  # 2026-08-31). docker-init as pid 1 forwards signals and reaps. See the
+  # "Known issues" section of README.md.
+  init: true
   ulimits:
     memlock: -1
     stack: 67108864
@@ -144,7 +152,10 @@ services:
       # rank's own pool (host_size * 1e9 // size_per_token), so TP=8 allocates
       # it EIGHT times -- MLA makes all eight copies identical, but they are
       # still eight allocations. 96 GB/rank => ~770 GB of MLA host pool plus
-      # ~22 GB/rank of DSA indexer host pool = ~944 GB of the ~2168 GB free.
+      # 19.32 GB/rank of DSA indexer host pool = ~922 GB of the ~2168 GB free.
+      # (19.32 GB/rank is the value the worker LOGS at startup -- "Allocating
+      # 19.32 GB host memory for DSA indexer" x8 -- not the 22.0 GB/rank the
+      # pre-work design doc estimated.)
       # SGLang hard-fails at startup if it over-requests, so raising this is
       # fail-safe, not fail-dangerous.
       - --enable-hierarchical-cache

@@ -1085,3 +1085,78 @@ TTFT after restart (5121 ms) sits between cold (20523 ms) and pre-restart-warm (
 **Conclusion: `/scratch` earns its place.** This is the one claim host RAM alone cannot make — L2 is gone on every restart, and disk is what carried the 131K-token prefix through it. The tiered design (GPU → host RAM → `/scratch` NVMe) is justified by this result: L3 is not redundant with L2, it is what makes cache survival possible across a restart at all.
 
 The stack was left UP and serving on `write_through` after this test (unchanged from state at test start); no further restart was performed after the measurement.
+
+## Profile B (hisparse, long context)
+
+**Question tested:** the repo documents that serving this model's full 1M-token context requires ≥2 nodes, and that Profile B (`PROFILE=longctx`, SGLang HiSparse) is the single-node attempt. Does a >524,288-token request actually complete on this node? If so, the ≥2-node claim is false.
+
+**Result: Profile B never started. The claim survives — it is reinforced, not falsified.**
+
+### Attempt 1: default config (`--mem-fraction-static=0.88`)
+
+```
+$ cd dynamo
+$ docker kill dynamo-worker-1 2>/dev/null; ./stop.sh
+$ PROFILE=longctx ./serve.sh
+```
+
+Worker container exited during startup, well before registration. `docker compose --profile longctx logs --tail=150 worker-longctx`:
+
+```
+Exception: Capture cuda graph failed: CUDA out of memory. Tried to allocate 1.50 GiB. GPU 6 has a total capacity of 139.80 GiB of which 488.19 MiB is free. Including non-PyTorch memory, this process has 139.20 GiB memory in use. Of the allocated memory 134.73 GiB is allocated by PyTorch, and 297.40 MiB is reserved by PyTorch but unallocated. ...
+
+Possible solutions:
+1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)
+2. set --cuda-graph-max-bs to a smaller value (e.g., 16)
+3. disable torch compile by not using --enable-torch-compile
+4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)
+```
+
+Traceback: `Scheduler.__init__` → `init_tp_model_worker` → `ModelRunner.initialize` → `init_device_graphs` → `CUDAGraphRunner.__init__` — the CUDA-graph-capture OOM the task brief flagged as known-plausible at `--mem-fraction-static=0.88` (measured 10.09 GB/GPU available at 0.85; 0.88 leaves only ~5.8 GB headroom).
+
+No mention of speculative decoding anywhere in the failure — MTP/EAGLE was not the cause here, so that authorized fix did not apply.
+
+### Attempt 2 (authorized retry): `MEM_FRACTION_LONG=0.86`
+
+```
+$ docker kill dynamo-worker-longctx-1 2>/dev/null; ./stop.sh
+$ MEM_FRACTION_LONG=0.86 PROFILE=longctx ./serve.sh
+```
+
+Same failure mode, same stage, different GPU, tighter margin than attempt 1:
+
+```
+Exception: Capture cuda graph failed: CUDA out of memory. Tried to allocate 1.31 GiB. GPU 1 has a total capacity of 139.80 GiB of which 1.24 GiB is free. Including non-PyTorch memory, this process has 138.44 GiB memory in use. Of the allocated memory 132.82 GiB is allocated by PyTorch, with 1.56 GiB allocated in private pools (e.g., CUDA Graphs), and 1.43 GiB is reserved by PyTorch but unallocated. ...
+```
+
+The container exited before ever reaching the point where `max_total_num_tokens` is logged — the OOM happens during CUDA graph capture in `ModelRunner.initialize`, which runs before the KV pool sizing that produces that line. **There is no `max_total_num_tokens`, no HiSparse indexer log, no `context_len` figure to report for Profile B — the worker never got that far.**
+
+Per the task's authorization (one retry per known-plausible cause, no further retries "hoping for a better number"), this is where testing stopped. Both authorized mitigations were exhausted:
+- Speculative decoding was never implicated (no such error appeared) — the four `--speculative-*` lines were never removed, so **MTP/EAGLE status is untested**, not "survived."
+- The mem-fraction retry (0.86) was tried once as authorized and still OOM'd, at an even tighter margin than the 0.88 default.
+
+### Step 3/4/5 — not performed
+
+No >512K request was attempted, no throughput benchmarks were run, and no `max_total_num_tokens`/HiSparse/indexer figures exist to record, because the worker process never reached a registered, serving state under Profile B at either mem-fraction tested. Reporting fabricated or extrapolated numbers for these steps would violate the honesty requirement of this task; they are left blank.
+
+### Verdict
+
+**The single-node ≥2-node constraint is NOT falsified by this test — if anything it is corroborated.** Not only does the documented 512K-token pool represent the practical ceiling for Profile A; Profile B's attempt to push past it via HiSparse **could not even complete engine initialization** on this node at either the spec's projected `--mem-fraction-static=0.88` or the authorized fallback of 0.86. Both attempts died identically: CUDA OOM during CUDA-graph capture, with well under 1.5 GB free per GPU at the moment of failure. The trend between the two attempts (488 MiB free → 1.24 GiB free, i.e. *less* headroom relief than the 0.02 reduction in mem-fraction should have produced, likely because loaded weights/model state don't scale down with `--mem-fraction-static`) suggests this is not a knob-tuning problem solvable by nudging mem-fraction further — the full 1,048,576-token addressable range HiSparse is configured for does not fit in this node's remaining ~5-6 GB/GPU of headroom once the 756 GB of FP8 weights and CUDA graph working set are accounted for, at least not without deeper changes (e.g. `--cuda-graph-max-bs`, `--disable-cuda-graph`, or a smaller `--context-length`) that are out of scope for this task's two authorized retries.
+
+**The trade this leaves undemonstrated:** whether HiSparse's page-from-host-RAM decode path is actually slower than Profile A (as documented) could not be measured, because Profile B could not be brought up at all. This task can only confirm the negative: on this single 8xH200 node, Profile B as currently configured does not start, and the ≥2-node claim for the full 1M-token context stands.
+
+### Stack state at end of task
+
+Restored to `PROFILE=cache`:
+
+```
+$ docker kill dynamo-worker-longctx-1 2>/dev/null; ./stop.sh
+$ PROFILE=cache ./serve.sh
+... REGISTERED ~90s
+$ curl -s --noproxy 127.0.0.1 http://127.0.0.1:8000/v1/models
+{"object":"list","data":[{"id":"glm-5.2-fp8","object":"model","created":1788204978,"owned_by":"nvidia","context_window":524288}]}
+$ docker compose --profile cache logs worker 2>&1 | grep -c "Allocating 96.00 GB host memory for hierarchical KV cache"
+8
+```
+
+All 8 TP-rank host-memory allocations present, confirming Profile A came back up correctly. No source files were modified during this task (the speculative-decoding removal authorized in the brief was never triggered, since the failure was OOM, not spec-decode-related).

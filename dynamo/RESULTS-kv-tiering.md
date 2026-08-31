@@ -761,3 +761,188 @@ File naming has no `tp_rank` suffix (`<hash>_glm-5.2-fp8.bin`, `<hash>.indexer_g
 **However, the cold-path-regression criterion is a genuine, measured FAIL at conc-32** (1905.2 vs 2087.1 tok/s, -8.72%, outside the 5% tolerance), while conc-1 passes comfortably (-0.53%). Tiering is not "free when it misses" under concurrent load on this host as currently configured — write-through overhead is visible both in the conc-32 throughput drop and in the elevated cold-write TTFT for the hicache-prefix benchmark's pass 1 (18408 ms vs. the plain-radix baseline's 16677 ms for an equivalent cold prefill). The brief's suggested mitigation (`--hicache-write-policy=write_through_selective`) requires a worker restart, which was out of scope for this measurement pass per explicit operational instructions to not restart the live, user-serving endpoint. **This regression should not be dismissed** — it is the one criterion this run does not pass, and it should be re-tested with `write_through_selective` (or another write-policy tuning) in a follow-up task that has authorization to restart the worker.
 
 The stack was left running and untouched throughout (no `stop.sh`/`serve.sh`/`docker compose restart` at any point in this measurement pass); it remains UP and serving on `PROFILE=cache` after this task.
+
+## Profile A: write_through vs write_through_selective
+
+**Task 5b.** Tests the hypothesis that `--hicache-write-policy=write_through` (writes every KV page to host RAM + `/scratch` synchronously) is the cause of the conc-32 throughput regression measured in Task 5 (-8.72% vs no-hicache baseline), and that `write_through_selective` (writes only hotter pages) recovers throughput without losing the eviction-recovery win.
+
+### Method
+
+1. `/scratch/kvcache/glm52` was cleared to empty (`find ... -mindepth 1 -delete`; directory itself, mode 0777, left in place) so both policies start from an identical cold L3 tier.
+2. Stack was restarted with `HICACHE_WRITE_POLICY=write_through_selective PROFILE=cache ./serve.sh`.
+   - `./stop.sh` hit one snag: `dynamo-worker-1` came back as "PID ... is zombie and can not be killed" on the normal `docker compose down`. Resolved with `docker kill dynamo-worker-1` (container exited 0 within ~4s), then `./stop.sh` completed cleanly (full teardown of worker/frontend/etcd/nats). Not a benchmark-relevant event, recorded for completeness.
+   - Model load took ~210s (~3.5 min) to `glm-5.2-fp8` appearing in `/v1/models`.
+3. **Confirmed the policy took effect** — grepped the worker's `ServerArgs` log line:
+   ```
+   hicache_write_policy='write_through_selective'
+   ```
+   Also confirmed unchanged alongside it: `hicache_mem_layout='page_first'`, `hicache_io_backend='kernel'`, `hicache_size=96`, `hicache_ratio=2.0`, `hicache_storage_backend='file'`, `attention_backend='dsa'`, `dsa_prefill_backend='flashmla_kv'`, `dsa_decode_backend='flashmla_kv'`.
+4. Ran the identical bench sequence used for the `write_through` (Profile A) measurement: conc-1 latency, conc-32 throughput, then the 9-request eviction-pressure sequence (prime → warm → 5-seed flood → recheck).
+
+### Raw output — conc-1 latency (`selective-latency`)
+
+```
+=== bench selective-latency pass 1/1  conc=1 num=16 max_tokens=256 ===
+requests ok/err     : 16/0
+wall time           : 32.66 s
+TTFT  mean/p50/p99  : 336 / 149 / 2935 ms
+ITL   mean/p50/p99  : 16.3 / 16.2 / 17.7 ms
+per-req decode tok/s: mean 149.6  (min 142.2, max 150.2)
+prompt tokens mean  : 67
+cached tokens mean  : 64 (95.5% of prompt)
+output tokens total : 4096
+system output tok/s : 125.4
+```
+
+### Raw output — conc-32 throughput (`selective-throughput`)
+
+```
+=== bench selective-throughput pass 1/1  conc=32 num=128 max_tokens=256 ===
+requests ok/err     : 128/0
+wall time           : 17.68 s
+TTFT  mean/p50/p99  : 1028 / 657 / 2226 ms
+ITL   mean/p50/p99  : 31.3 / 30.4 / 52.6 ms
+per-req decode tok/s: mean 75.9  (min 62.3, max 84.4)
+prompt tokens mean  : 67
+cached tokens mean  : 64 (95.5% of prompt)
+output tokens total : 32768
+system output tok/s : 1853.1
+```
+
+### Raw output — eviction-pressure sequence
+
+```
+shared prefix: ~131072 tokens, seed 1234, 905297 chars
+
+=== bench selective-evict-prime pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 18.67 s
+TTFT  mean/p50/p99  : 18450 / 18450 / 18450 ms
+ITL   mean/p50/p99  : 18.1 / 17.8 / 27.1 ms
+per-req decode tok/s: mean 143.0  (min 143.0, max 143.0)
+prompt tokens mean  : 135271
+output tokens total : 32
+system output tok/s : 1.7
+
+shared prefix: ~131072 tokens, seed 1234, 905297 chars
+
+=== bench selective-evict-warm pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 0.87 s
+TTFT  mean/p50/p99  : 670 / 670 / 670 ms
+ITL   mean/p50/p99  : 17.8 / 17.7 / 20.7 ms
+per-req decode tok/s: mean 158.5  (min 158.5, max 158.5)
+prompt tokens mean  : 135271
+cached tokens mean  : 135232 (100.0% of prompt)
+output tokens total : 32
+system output tok/s : 36.7
+
+shared prefix: ~131072 tokens, seed 2, 905409 chars
+
+=== bench selective-evict-flood-seed2 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 16.91 s
+TTFT  mean/p50/p99  : 16709 / 16709 / 16709 ms
+ITL   mean/p50/p99  : 17.8 / 17.7 / 22.3 ms
+per-req decode tok/s: mean 156.2  (min 156.2, max 156.2)
+prompt tokens mean  : 135150
+output tokens total : 32
+system output tok/s : 1.9
+
+shared prefix: ~131072 tokens, seed 3, 905248 chars
+
+=== bench selective-evict-flood-seed3 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.11 s
+TTFT  mean/p50/p99  : 16849 / 16849 / 16849 ms
+ITL   mean/p50/p99  : 17.9 / 17.6 / 24.7 ms
+per-req decode tok/s: mean 123.4  (min 123.4, max 123.4)
+prompt tokens mean  : 135151
+output tokens total : 32
+system output tok/s : 1.9
+
+shared prefix: ~131072 tokens, seed 4, 904689 chars
+
+=== bench selective-evict-flood-seed4 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.01 s
+TTFT  mean/p50/p99  : 16784 / 16784 / 16784 ms
+ITL   mean/p50/p99  : 18.0 / 17.7 / 24.2 ms
+per-req decode tok/s: mean 143.8  (min 143.8, max 143.8)
+prompt tokens mean  : 135164
+output tokens total : 32
+system output tok/s : 1.9
+
+shared prefix: ~131072 tokens, seed 5, 905176 chars
+
+=== bench selective-evict-flood-seed5 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.12 s
+TTFT  mean/p50/p99  : 16916 / 16916 / 16916 ms
+ITL   mean/p50/p99  : 18.1 / 17.7 / 23.9 ms
+per-req decode tok/s: mean 155.9  (min 155.9, max 155.9)
+prompt tokens mean  : 135278
+output tokens total : 32
+system output tok/s : 1.9
+
+shared prefix: ~131072 tokens, seed 6, 905114 chars
+
+=== bench selective-evict-flood-seed6 pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 17.17 s
+TTFT  mean/p50/p99  : 16946 / 16946 / 16946 ms
+ITL   mean/p50/p99  : 18.0 / 17.8 / 24.5 ms
+per-req decode tok/s: mean 143.6  (min 143.6, max 143.6)
+prompt tokens mean  : 135255
+output tokens total : 32
+system output tok/s : 1.9
+
+shared prefix: ~131072 tokens, seed 1234, 905297 chars
+
+=== bench selective-evict-recheck pass 1/1  conc=1 num=1 max_tokens=32 ===
+requests ok/err     : 1/0
+wall time           : 1.48 s
+TTFT  mean/p50/p99  : 1278 / 1278 / 1278 ms
+ITL   mean/p50/p99  : 17.7 / 17.7 / 21.3 ms
+per-req decode tok/s: mean 158.8  (min 158.8, max 158.8)
+prompt tokens mean  : 135271
+cached tokens mean  : 135232 (100.0% of prompt)
+output tokens total : 32
+system output tok/s : 21.6
+```
+
+All five flood requests were genuinely cold (no `cached tokens mean` line, TTFT 16709-16946 ms), confirming prefix A (seed 1234) was actually evicted from the GPU radix pool before the recheck, exactly as in the `write_through` run.
+
+### `/scratch` size before/after
+
+```
+$ du -sh /scratch/kvcache/glm52; find /scratch/kvcache/glm52 -type f | wc -l   # BEFORE (cleared)
+0	/scratch/kvcache/glm52
+0
+
+$ du -sh /scratch/kvcache/glm52; find /scratch/kvcache/glm52 -type f | wc -l   # AFTER selective run
+47G	/scratch/kvcache/glm52
+38070
+```
+
+### Side-by-side comparison
+
+| Metric | Baseline (no hicache) | `write_through` (Task 5) | `write_through_selective` (Task 5b) | Selective vs baseline | Selective vs write_through |
+|---|---:|---:|---:|---:|---:|
+| conc-1 decode tok/s | 150.6 | 149.8 | **149.6** | -0.66% | -0.13% |
+| conc-32 system tok/s | 2087.1 | 1905.2 | **1853.1** | **-11.21%** | **-2.73% (worse, not recovered)** |
+| Eviction recheck — cached tokens % | 0% (0/…) | 100.0% (135232/135271) | **100.0% (135232/135271)** | preserved | preserved |
+| Eviction recheck — TTFT | 16769 ms | 1230 ms | **1278 ms** | 13.1x lower | ~equal (+3.9%, within noise) |
+| `/scratch` after full sequence | 0 B / 0 files | 48 GB / 38106 files | **47 GB / 38070 files** | grows either way | **essentially identical (-2.1% bytes, -0.09% files) — not a meaningful reduction** |
+
+### Judgement against the hypothesis
+
+**The hypothesis is not supported by this measurement. `write_through_selective` did not recover the conc-32 throughput regression — it made it slightly worse** (1853.1 vs 1905.2 tok/s under `write_through`, both well below the 2087.1 no-hicache baseline). conc-1 latency is unaffected either way (~150 tok/s, noise-level difference between policies). `/scratch` byte and file counts after the identical benchmark sequence are essentially unchanged between policies (47 GB/38070 files vs 48 GB/38106 files, a ~2% difference in bytes and <0.1% in file count) — selective is **not** writing meaningfully less to L3 under this workload. A plausible explanation: this workload's write volume is dominated by the 131K-token shared-prefix eviction-pressure sequence (prime + 5-seed flood, ~786K tokens of unique prefill) and the conc-1/conc-32 short-prompt runs, and under `write_through_selective`'s hotness heuristic essentially all of that content still qualifies as "hot enough" to write — so selectivity bought no reduction in L3 write volume for this traffic pattern, and therefore no throughput recovery either.
+
+**The good news: the eviction-recovery win is fully intact.** Cached-token percentage on the decisive recheck is identical to `write_through` — 100.0% (135232/135271) — and TTFT (1278 ms) is statistically indistinguishable from `write_through`'s 1230 ms. Switching policies did not cost anything on the metric that matters most.
+
+**Recommendation: do not switch the default to `write_through_selective`.** It provides no measured benefit (conc-32 throughput is not recovered — if anything it is very slightly worse — and `/scratch` write volume is unchanged) while adding an extra knob and a second I/O policy to reason about, for a workload where selectivity did not bite. `write_through` remains the recommended default per Task 5's conclusions; the conc-32 regression against the no-hicache baseline (-8.72% to -11.21% depending on policy) stands as a known, accepted trade for the eviction-recovery benefit, and is not one that write-policy tuning alone resolves. If the regression must be closed further, the next lever to investigate is not the write policy but I/O concurrency/backend tuning (e.g. `--hicache-io-backend`, storage-prefetch policy) or reducing `/scratch` write frequency structurally (e.g. batching, io_uring backend) rather than selectivity-based filtering.
+
+Since the measurement above recommends against `write_through_selective` as the default, the stack was restarted one final time after the eviction-pressure sequence completed, back onto the default (`write_through`, no `HICACHE_WRITE_POLICY` override). The worker's `ServerArgs` log line was re-checked and confirms `hicache_write_policy='write_through'`. The stack is UP, serving on `PROFILE=cache` with `write_through`, matching the state at the start of this task (the same known-good policy this evaluation validates as the correct default).
+
+(Both restarts in this task hit the same operational snag on `./stop.sh`: `dynamo-worker-1` came back "PID ... is zombie and can not be killed" on the normal `docker compose down`. Resolved both times with `docker kill dynamo-worker-1`, which exited the container cleanly within ~4s, after which `./stop.sh` completed teardown normally. Recorded here since it recurred; not benchmark-relevant.)

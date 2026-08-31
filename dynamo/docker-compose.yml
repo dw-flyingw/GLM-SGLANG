@@ -167,7 +167,13 @@ services:
       # fail-safe, not fail-dangerous.
       - --enable-hierarchical-cache
       - --hicache-size=${HICACHE_GB:-96}
-      - --hicache-write-policy=write_through
+      # write_through writes EVERY page to the host and /scratch tiers synchronously.
+      # Measured 2026-08-31: that costs ~8.7% system throughput at concurrency 32
+      # (1905.2 vs 2087.1 tok/s baseline) while concurrency 1 is unaffected (-0.5%),
+      # which is the signature of per-page write overhead concentrating where pages
+      # are produced fastest. write_through_selective writes only hotter pages.
+      # Override to A/B without editing this file.
+      - --hicache-write-policy=${HICACHE_WRITE_POLICY:-write_through}
       # `kernel` I/O survives here: it is only downgraded to `direct` when the
       # effective DECODE backend is fa3, and ours is the auto-selected
       # dsa/flashmla_kv. Verify from the startup log rather than trusting this.

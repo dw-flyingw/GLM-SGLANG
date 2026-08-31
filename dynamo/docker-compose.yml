@@ -241,6 +241,17 @@ services:
       # that ~0.93 risks OOM at CUDA-graph capture, so 0.88 is not pushed further.
       - --context-length=${MAX_MODEL_LEN_LONG:-1048576}
       - --mem-fraction-static=${MEM_FRACTION_LONG:-0.88}
+      # SGLang defaults cuda_graph_max_bs to 512, but --max-running-requests caps
+      # concurrency at 128, so graphs for batch sizes 129-512 can never be scheduled
+      # -- they are pure wasted GPU memory. That waste is affordable under Profile A
+      # and is not under Profile B: the first longctx attempt died with
+      #   "Capture cuda graph failed: CUDA out of memory. Tried to allocate 1.31 GiB.
+      #    GPU 1 has ... 1.24 GiB is free ... 1.56 GiB allocated in private pools
+      #    (e.g., CUDA Graphs)"
+      # i.e. it missed by ~70 MB while holding 1.56 GiB of graph pools it cannot use.
+      # Capping capture at the real concurrency ceiling reclaims that. Also shortens
+      # startup, since there are fewer graphs to capture.
+      - --cuda-graph-max-bs=${CUDA_GRAPH_MAX_BS_LONG:-128}
       # MTP/EAGLE is carried over UNVERIFIED: nothing in SGLang forbids it with
       # HiSparse and nothing exercises it either. If startup fails citing
       # speculative decoding, delete these four lines and re-run -- Profile B

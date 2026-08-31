@@ -26,8 +26,17 @@ container's uid 1000, not just the host user** before the first start:
 ```bash
 sudo mkdir -p /scratch/kvcache/glm52
 sudo chown -R 1000:$(id -g) /scratch/kvcache
-sudo chmod -R 0777 /scratch/kvcache        # container (uid 1000) must be able to write it
+sudo chmod -R 2775 /scratch/kvcache
 ```
+
+Owner `1000` so the container can write; your host group kept with `g+w` so the
+reaper (`dynamo/kv_reaper.py`, run from cron as the host user) can still delete
+what the container creates; setgid so new files inherit that group. `serve.sh`
+prints these same two commands if its probe fails.
+
+Without root, `chmod -R 0777 /scratch/kvcache` also works — the owner may chmod
+without being root — but it is world-writable, so prefer the `chown` above where
+you can.
 
 A fresh clone following a naive `chown $(id -u)` (host user, not uid 1000) will
 hit `serve.sh`'s guard: it fails fast with a **containerized** write probe (a

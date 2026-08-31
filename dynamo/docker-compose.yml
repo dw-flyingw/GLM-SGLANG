@@ -29,20 +29,7 @@ x-dynamo-env: &dynamo-env
 x-worker-base: &worker-base
   image: ${DYNAMO_IMAGE:-glm52-dynamo-sglang:0.5.13post1}
   network_mode: host
-  # WORKAROUND (2026-08-31) -- was `gpus: all`. Revert to `gpus: all` once the
-  # host's CDI spec is fixed (it regenerates itself on reboot).
-  #
-  # sprocket's driver was upgraded 590.48.01 -> 595.71.05 on 2026-08-11 without a
-  # reboot, so /run/cdi/nvidia.yaml is still the spec generated at the 2026-08-10
-  # boot and names 590 library files that no longer exist. `gpus: all` resolves
-  # through nvidia-container-runtime's CDI mode (config.toml has mode="auto",
-  # which prefers CDI when a spec is present), so every GPU container fails at
-  # mount time with:
-  #     open /usr/lib/.../libEGL_nvidia.so.590.48.01: no such file or directory
-  # The LEGACY path is unaffected -- nvidia-container-cli correctly reports
-  # 595.71.05 -- so pin the runtime explicitly to route around the stale spec.
-  # Verified working by `docker run --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all`.
-  runtime: nvidia
+  gpus: all
   ipc: host
   ulimits:
     memlock: -1
@@ -103,11 +90,6 @@ services:
       <<: *dynamo-env
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
-      # Required by the legacy nvidia runtime (see the runtime: nvidia note in
-      # x-worker-base). `gpus: all` used to carry the device request; with the
-      # runtime pinned, visibility comes from these instead.
-      NVIDIA_VISIBLE_DEVICES: "all"
-      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       # HiCacheFile defaults to /tmp/hicache -- the 446 GB ROOT filesystem --
       # if this is unset, which would fill the boot disk. Setting it is not
       # optional. serve.sh fails fast if the directory is missing.
@@ -206,12 +188,6 @@ services:
       <<: *dynamo-env
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
-      # Required by the legacy nvidia runtime (see the runtime: nvidia note in
-      # x-worker-base). `gpus: all` used to carry the device request; with the
-      # runtime pinned, visibility comes from these instead. NOT inherited from
-      # x-worker-base -- environment is a whole-key replace on merge.
-      NVIDIA_VISIBLE_DEVICES: "all"
-      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     volumes:
       - "${HF_CACHE:-/root/.cache/huggingface}:${HF_CACHE:-/root/.cache/huggingface}"
       - "dynamo-jit-cache:/home/dynamo/.cache"

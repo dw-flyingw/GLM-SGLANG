@@ -1160,3 +1160,94 @@ $ docker compose --profile cache logs worker 2>&1 | grep -c "Allocating 96.00 GB
 ```
 
 All 8 TP-rank host-memory allocations present, confirming Profile A came back up correctly. No source files were modified during this task (the speculative-decoding removal authorized in the brief was never triggered, since the failure was OOM, not spec-decode-related).
+
+## Profile B retry (cuda-graph-max-bs 128)
+
+Retry of the above, testing the fix in commit `92acc5e` (`fix(dynamo): cap longctx CUDA graph capture at the concurrency ceiling`): `worker-longctx` now passes `--cuda-graph-max-bs=${CUDA_GRAPH_MAX_BS_LONG:-128}`, capping CUDA-graph capture at the same ceiling as `--max-running-requests=128`, instead of SGLang's default of 512. The theory was that graphs for batch sizes 129-512 were being captured but could never be scheduled, wasting ~1.56 GiB of "private pools (e.g., CUDA Graphs)" memory that the previous attempt's failure log showed.
+
+### Attempt: `PROFILE=longctx` with the `cuda-graph-max-bs=128` fix in place
+
+```
+$ cd /home/users/wrightda/src/GLM-5.2-FP8/dynamo
+$ docker kill dynamo-worker-1 2>/dev/null; ./stop.sh
+Container dynamo-frontend-1 Stopped/Removed
+Container dynamo-worker-1 Stopped/Removed
+Container dynamo-nats-1 Stopped/Removed
+Container dynamo-etcd-1 Stopped/Removed
+Dynamo stack stopped.
+
+$ PROFILE=longctx ./serve.sh
+Starting Dynamo (SGLang) stack for GLM-5.2-FP8 [profile: longctx] ...
+... Up.
+```
+
+Poll loop result:
+
+```
+WORKER DIED at ~165s
+```
+
+`docker ps -a` confirmed: `dynamo-worker-longctx-1  Exited (0)  15 seconds ago` (the exit code is misleadingly `0` — the process was killed by its own sigquit handler after a child crashed, not a clean shutdown).
+
+### Failure — same OOM class, different (and worse) failure point
+
+`docker compose --profile longctx logs --tail=200 worker-longctx` (relevant excerpt, verbatim):
+
+```
+worker-longctx-1  |   File "/home/dynamo/.local/lib/python3.12/site-packages/sglang/srt/layers/attention/dsa/dsa_indexer.py", line 685, in _get_topk_paged
+worker-longctx-1  |     logits = deep_gemm.fp8_paged_mqa_logits(
+worker-longctx-1  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+worker-longctx-1  |   File "/usr/local/lib/python3.12/dist-packages/deep_gemm/__init__.py", line 221, in fp8_paged_mqa_logits
+worker-longctx-1  |     return _C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices)
+worker-longctx-1  | tvm.error.InternalError: CUDA out of memory. Tried to allocate 1.50 GiB. GPU 5 has a total capacity of 139.80 GiB of which 488.19 MiB is free. Including non-PyTorch memory, this process has 139.20 GiB memory in use. Of the allocated memory 134.73 GiB is allocated by PyTorch, and 297.40 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.
+
+... (same trace re-raised as, further down) ...
+
+worker-longctx-1  |   File "/home/dynamo/.local/lib/python3.12/site-packages/sglang/srt/model_executor/model_runner.py", line 2908, in init_device_graphs
+worker-longctx-1  |     self.graph_runner = graph_runners[self.device](self)
+worker-longctx-1  |   File "/home/dynamo/.local/lib/python3.12/site-packages/sglang/srt/model_executor/cuda_graph_runner.py", line 628, in __init__
+worker-longctx-1  |     raise Exception(
+worker-longctx-1  | Exception: Capture cuda graph failed: CUDA out of memory. Tried to allocate 1.50 GiB. GPU 5 has a total capacity of 139.80 GiB of which 488.19 MiB is free. Including non-PyTorch memory, this process has 139.20 GiB memory in use. Of the allocated memory 134.73 GiB is allocated by PyTorch, and 297.40 MiB is reserved by PyTorch but unallocated.
+
+Possible solutions:
+1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)
+2. set --cuda-graph-max-bs to a smaller value (e.g., 16)
+3. disable torch compile by not using --enable-torch-compile
+4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)
+
+[2m2026-08-31T19:41:52.922414Z[0m [31mERROR[0m [2mengine.launch_phase_sigquit_handler[0m[2m:[0m Received sigquit from a child process. It usually means the child failed.
+```
+
+This is a materially different failure site from both prior attempts. The two previous OOMs (attempt 1 at `mem-fraction=0.88`, attempt 2 at `0.86`) both failed inside `CUDAGraphRunner.__init__`'s generic graph capture, with 1.24-5.8 GiB nominally free at the moment of failure. This attempt got *past* that stage — the `cuda-graph-max-bs=128` cap did shrink the wasted-graph problem it targeted — but then failed one call deeper, inside the **HiSparse indexer's own CUDA graph capture** (`dsa_indexer.py::_get_topk_paged` → `deep_gemm.fp8_paged_mqa_logits`), with only **488.19 MiB free** (worse headroom than either prior attempt) and 139.20 GiB of 139.80 GiB already in use on that GPU.
+
+In other words: the fix worked exactly as intended (fewer wasted graphs, capture proceeds further), but capture now runs long enough to reach the indexer's own graph-capture pass, which itself needs ~1.5 GiB it does not have — because reclaiming the 512→128 headroom just let the allocator spend that reclaimed space on *more* real capture work before running out again. This is not a case of "off by 70 MB"; the process is fully pinned (139.20/139.80 GiB in use) by the time it fails.
+
+### Steps 3-5 — not performed
+
+The worker never reached a registered state, so there is no `max_total_num_tokens`, no HiSparse/indexer sizing line, no `context_len` figure, and no bench_stream.py run to report. The decisive 600K-token test (step 4) and the cost-comparison benchmarks (step 5) were not attempted, per the task's instruction to go straight to restoring Profile A on a second OOM/death.
+
+### Verdict
+
+**Profile B still does not initialize on this single 8xH200 node, even with the `cuda-graph-max-bs=128` fix.** The fix addressed its target defect (graphs for unreachable batch sizes 129-512) but did not close the gap — it merely moved the OOM one call deeper, into the HiSparse indexer's own graph capture, with less free memory at the point of failure than either prior attempt (488 MiB vs. 1.24 GiB / ~5.8 GiB). This corroborates, more strongly than the first attempt, that Profile B's HiSparse configuration for a ~1,048,576-token pool does not fit in a single node's per-GPU headroom once weights, ordinary CUDA graphs, and the indexer's own paged-MQA graph capture are all accounted for — the shortfall is not a small tuning margin, it is the GPU being fully pinned (139.20/139.80 GiB) before capture finishes.
+
+**Documented config change needed (not applied, per "no source edits" instruction):** the SGLang error message itself is explicit about the remaining levers — `--mem-fraction-static` lower than 0.86, `--cuda-graph-max-bs` lower than 128 (SGLang's own suggestion is as low as 16, which would materially hurt throughput for a concurrency-128 deployment), `--disable-cuda-graph` (called out by SGLang as "Not recommended, huge performance loss"), or reducing the target context length so HiSparse's own paged-KV structures are smaller. None of these were authorized for this attempt. The most likely durable fix is a smaller `--context-length` for Profile B rather than further mem-fraction/graph-count tuning, since the indexer's own working set scales with the addressable context, not just with concurrency.
+
+**The single-node ≥2-node constraint is further corroborated, not falsified**, by this retry: two independent, differently-targeted mitigations (mem-fraction reduction, then cuda-graph-max-bs reduction) both produced CUDA OOM during engine initialization, at progressively deeper (but still pre-serving) points in startup, with progressively tighter memory margins. The 1M-token HiSparse configuration does not fit this node.
+
+### Stack state at end of task
+
+Restored to `PROFILE=cache`:
+
+```
+$ docker kill dynamo-worker-longctx-1 2>/dev/null; ./stop.sh
+Dynamo stack stopped.
+$ PROFILE=cache ./serve.sh
+... Up.
+$ [poll loop] REGISTERED ~210s
+$ curl -s --noproxy 127.0.0.1 http://127.0.0.1:8000/v1/models
+{"object":"list","data":[{"id":"glm-5.2-fp8","object":"model","created":1788205580,"owned_by":"nvidia","context_window":524288}]}
+$ docker compose --profile cache logs --tail=500 worker 2>&1 | grep -c "Allocating 96.00 GB host memory for hierarchical KV cache"
+8
+```
+
+All 8 TP-rank host-memory allocations present, confirming Profile A came back up correctly. No source files were modified during this task.

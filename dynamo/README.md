@@ -67,13 +67,15 @@ editing the worker `command:` in `docker-compose.yml`.
   `dsa`/`flashmla_kv` (Hopper + fp8 KV). Verified ~+8% system tok/s at conc 32 vs the
   legacy `nsa` backend we used to force.
 - `--dyn-tool-call-parser glm47`, `--dyn-reasoning-parser glm45` (Dynamo frontend parsers)
-- **`--context-length 524288` (512K).** 1M is the model's max, but a single node
-  can't hold a 1M-token KV cache next to the ~94 GB/GPU weights: at
-  `--mem-fraction-static 0.85` the decode pool is `max_total_num_tokens=540800`,
-  so 512K is the largest length a full request can actually be served at. True 1M
-  needs ≥ 2 nodes (same reason as disaggregation). To chase a larger pool you'd
-  raise `MEM_FRACTION` toward ~0.93 (only ~9 GB/GPU free — risks OOM at graph
-  capture, and still falls short of 1M).
+- **`--context-length 524288` (512K), served under `PROFILE=cache` with a tiered
+  prefix cache.** 1M is the model's max, but a single node can't hold a 1M-token
+  KV cache next to the ~94 GB/GPU weights: measured 2026-08-31, the decode pool
+  under Profile A is `max_total_num_tokens=540928`, so 512K is the largest length
+  a full request can actually be served at with full prefix-caching fidelity.
+  `PROFILE=longctx` is the single-node attempt at the full 1M context via
+  SGLang HiSparse instead of a bigger GPU pool — see "Tiered KV cache" below for
+  why it doesn't currently start on this hardware, and why true 1M still needs
+  ≥ 2 nodes (same reason as disaggregation).
 - **MTP / EAGLE speculative decoding (enabled).** GLM-5.2 ships 1 MTP layer; EAGLE
   drives it from the main checkpoint (no separate draft model):
   `--speculative-algorithm EAGLE --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3`.
@@ -98,6 +100,98 @@ editing the worker `command:` in `docker-compose.yml`.
 - **KV-aware routing** — add `--router-mode kv` to the frontend and a `--kv-events-config`
   to the worker; only a win with ≥ 2 workers/replicas.
 
+### Tiered KV cache
+
+`PROFILE=cache` (the default) adds a hierarchical prefix cache below the GPU
+radix cache: GPU pool → host RAM (L2) → `/scratch` NVMe (L3). All figures
+below are measured 2026-08-31 against this deployment (image tag
+`glm52-dynamo-sglang:0.5.13post1`), recorded in full in
+[`RESULTS-kv-tiering.md`](RESULTS-kv-tiering.md).
+
+**Tier sizes:**
+
+| Tier | Size | Notes |
+|---|---|---|
+| GPU pool | **540,928 tokens** (`max_total_num_tokens`), measured | shared radix cache, evicted under pressure |
+| L2 host RAM | **96 GB/rank × 8 TP ranks** (~972 GB RAM in use, `free -g` measured) | MLA replicates the pool identically across ranks — 8 real allocations of the same content, not 8 distinct shards |
+| L3 `/scratch` | deduplicated across TP ranks | the `file` storage backend's keys carry **no `tp_rank` suffix** for MLA models — verified by direct inspection of the files under `/scratch/kvcache/glm52` (`<hash>_glm-5.2-fp8.bin`, `<hash>.indexer_glm-5.2-fp8.bin`, `<hash>.draft_glm-5.2-fp8.bin`, 3 files per page-key) — so disk holds **one** copy per unique page, unlike L2's 8x replication |
+
+**Headline result — eviction survival.** A 131,072-token shared prefix was
+primed, confirmed warm, then evicted by flooding 655,360 tokens (5 distinct
+131K prefixes) through the 540,928-token GPU pool. Re-requesting the evicted
+prefix:
+
+| State | TTFT | Cached tokens |
+|---|---:|---:|
+| Before tiering (plain GPU radix cache only) | **16,769 ms** | 0 / 135,271 (0%) |
+| After tiering (`write_through`, same eviction test) | **1,230 ms** | 135,232 / 135,271 (100%) |
+| After tiering **and a worker restart** (L2 host RAM freshly reallocated and confirmed empty at boot) | **5,121 ms** | 135,232 / 135,271 (100%) |
+
+The third row is the proof `/scratch` — not host RAM — served the prefix:
+L2 is wiped on every worker restart (8 fresh `Allocating 96.00 GB host
+memory` lines, all timestamped at the new boot), so the only place those
+135,232 cached tokens could have come from after a restart is L3 on disk.
+TTFT after restart (5,121 ms) sits between a cold refill (~16.7-20.5 s) and
+an in-RAM hit (~650-750 ms) — the expected shape of a disk read followed by
+a copy back into GPU/L2, and categorically faster than recomputing the
+prefix from scratch.
+
+**The honest cost.** Tiering is not free under concurrent load:
+
+| Metric | No hicache (baseline) | `write_through` (default) | Δ |
+|---|---:|---:|---:|
+| conc-32 system throughput | 2087.1 tok/s | **1905.2 tok/s** | **-8.7%** |
+| conc-1 decode (per-req) | 150.6 tok/s | **149.8 tok/s** | -0.5% (unaffected) |
+
+`write_through_selective` (write only hotter pages, instead of every page)
+was tested as the prescribed mitigation for the conc-32 regression. **It did
+not recover it** — throughput came back *lower* (1853.1 tok/s), and
+`/scratch` write volume was essentially unchanged (47 GB / 38,070 files vs.
+48 GB / 38,106 files for the identical benchmark sequence), meaning
+selectivity did not reduce what got written for this traffic pattern.
+`write_through` therefore remains the default. The eviction-recovery result
+is identical under either policy (100% cached, TTFT statistically
+indistinguishable), so the regression is a real, accepted trade for the
+eviction-survival benefit — it is not something write-policy tuning alone
+closes.
+
+**Tunables (env):**
+
+| Var | Default | Purpose |
+|---|---|---|
+| `PROFILE` | `cache` | `cache` = Profile A (tiered KV cache, 512K); `longctx` = Profile B (HiSparse, 1M target — does not currently start, see below) |
+| `HICACHE_GB` | `96` | L2 host RAM pool size, **per TP rank** (see tier table above for why this multiplies by 8) |
+| `HICACHE_WRITE_POLICY` | `write_through` | `write_through` (every page, default) vs `write_through_selective` (hotter pages only — measured not to help, see above) |
+| `KV_SCRATCH_ROOT` | `/scratch/kvcache` | host directory bind-mounted into the container (the whole tree) |
+| `KV_SCRATCH_DIR` | `/scratch/kvcache/glm52` | this model's subdirectory under `KV_SCRATCH_ROOT`; must stay under it or it isn't visible in the container |
+| `HISPARSE_DEVICE_BUFFER` | `4096` | Profile B only — HiSparse device-side buffer size |
+| `HISPARSE_RATIO` | `2` | Profile B only — HiSparse host-to-device ratio |
+| `MAX_MODEL_LEN_LONG` | `1048576` | Profile B only — target context length (the full 1M) |
+| `MEM_FRACTION_LONG` | `0.88` | Profile B only — tried at `0.88` and `0.86`, both OOM (see below) |
+| `CUDA_GRAPH_MAX_BS_LONG` | `128` | Profile B only — caps CUDA-graph capture at the concurrency ceiling instead of SGLang's default 512; reduced but did not close the OOM (see below) |
+
+**Profile B (HiSparse, 1M context) — does not start on this hardware.** Three
+attempts, all CUDA OOM during CUDA-graph capture, none reaching a registered
+state:
+
+1. `--mem-fraction-static=0.88` (default): OOM in generic graph capture,
+   488.19 MiB free at failure (GPU 6).
+2. `MEM_FRACTION_LONG=0.86`: same failure mode, but *more* free memory at
+   failure (1.24 GiB, GPU 1) — freeing more static memory did not translate
+   into proportionally more graph-capture headroom.
+3. `0.88` with `CUDA_GRAPH_MAX_BS_LONG=128`: got past the generic
+   graph-capture stage (host pools allocated, DeepGEMM warmup complete), then
+   OOM'd one call deeper, inside the **HiSparse indexer's own graph capture**
+   (`dsa_indexer.py::_get_topk_paged`), needing 1.50 GiB with only 488 MiB
+   free and the GPU fully pinned (139.20/139.80 GiB in use).
+
+Diagnosis: the indexer's capture working set scales with HiSparse's
+1,048,576-token addressable range, not with request concurrency, so
+graph-count and mem-fraction tuning cannot close the gap — the untried lever
+is a smaller `--context-length` for this profile. Full logs and exact
+commands: `RESULTS-kv-tiering.md`, section "Profile B (hisparse, long
+context)".
+
 ## Benchmark
 
 The runtime image does **not** ship `aiperf`/`genai-perf` (so `bench.sh` won't run
@@ -113,12 +207,19 @@ TTFT / ITL / decode throughput:
 
 ### Results — MTP speculative decoding OFF vs ON (8× H200, TP=8, 2026-06-27)
 
+Two MTP-on cells below (conc-1 decode tok/s and conc-32 system tok/s) were
+corrected 2026-08-31 against the no-hicache baseline re-measured in
+`RESULTS-kv-tiering.md` (same `bench_stream.py --concurrency 1 --num 16` /
+`--concurrency 32 --num 128` scenarios); the earlier figures here were stale.
+The remaining cells are unchanged from the original 2026-06-27 measurement
+and were not re-run for this correction.
+
 | Profile | Metric | MTP off | MTP on | Δ |
 |---|---|---|---|---|
-| Latency (conc 1)   | decode tok/s (per req) | 75.4   | **150.0** | **1.99×** |
+| Latency (conc 1)   | decode tok/s (per req) | 75.4   | **150.6** | **2.00×** |
 | Latency (conc 1)   | system tok/s           | 74.7   | 136.9     | 1.83× |
 | Latency (conc 1)   | TTFT mean              | 45 ms  | 169 ms    | +draft overhead |
-| Throughput (conc 32) | system tok/s         | 1636.9 | **1975.0** | 1.21× |
+| Throughput (conc 32) | system tok/s         | 1636.9 | **2087.1** | 1.28× |
 | Throughput (conc 32) | decode tok/s (per req) | 52.5 | 73.9      | 1.41× |
 
 Worker decode stats with MTP on show `accept len ≈ 2.2–2.8` (accept rate
@@ -144,10 +245,36 @@ the expected speculative-decoding profile.
 - [x] **EP + DP-attention "throughput" config benchmarked and rejected** (2026-06-28):
       regressed to 910 vs 1580 system tok/s at conc 32 + halved KV pool — TP=8 stays
       (it's a ≥ 2-node lever; see Performance levers)
-- [x] **Context raised to 512K** (`--context-length 524288`); 1M is not servable on
-      one node (KV pool `max_total_num_tokens=540800` at mem-fraction 0.85)
+- [x] **Context raised to 512K** (`--context-length 524288`); full-fidelity 1M is
+      not servable on one node (KV pool `max_total_num_tokens=540928` measured
+      under Profile A, mem-fraction 0.85)
 - [x] Benchmark recorded (MTP off vs on, `bench_stream.py`) — see Benchmark section
 - [ ] Benchmark vs the vLLM path (still blocked: no Dynamo vLLM ≥ 0.23.0 image)
+- [x] **Profile A (tiered KV cache) benchmarked** (2026-08-31): eviction survival
+      is a clean PASS (evicted 131K-token prefix: 0% cached / 16,769 ms TTFT
+      before tiering → 100% cached / 1,230 ms after); conc-32 throughput
+      regresses -8.7% (1905.2 vs 2087.1 tok/s), conc-1 unaffected (-0.5%) — see
+      "Tiered KV cache" above
+- [x] **Restart persistence (L3 survival) verified** (2026-08-31): a fresh
+      131K-token prefix, cached, then read back at 100% cached / 5,121 ms TTFT
+      after a full worker restart that wiped L2 host RAM — proves `/scratch`
+      (not host RAM) served it
+- [x] **Profile B (HiSparse, 1M context) attempted and does not start on this
+      hardware** (2026-08-31): 3/3 attempts CUDA OOM during CUDA-graph
+      capture (default mem-fraction, reduced mem-fraction, and reduced
+      cuda-graph-max-bs) — see "Tiered KV cache" above and `CONTEXT_WINDOW.md`
+
+### Known issues
+
+- **`./stop.sh` intermittently fails to kill `dynamo-worker-1`** with
+  `PID ... is zombie and can not be killed. Use the --init option when
+  creating containers to run an init inside the container that forwards
+  signals and reaps processes.` This hit every restart performed during the
+  KV-cache-tiering measurement pass (2026-08-31). Workaround: run
+  `docker kill dynamo-worker-1` first (exits cleanly within a few seconds),
+  then `./stop.sh` completes its teardown normally. Not investigated further
+  (root cause is presumably the container missing an init/reaper process);
+  cosmetic in that teardown still succeeds once you clear the zombie.
 
 ### Build gotchas (offline / behind-a-proxy environments)
 

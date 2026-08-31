@@ -21,6 +21,36 @@
 - **`/scratch` is root-owned and `sudo` needs a password**, so directory creation is a human step (Task 4), never automated.
 - Exact values that must appear verbatim: `--hicache-size` default `96`, reaper budget default `10TB`, `top_k` `2048`, `host_to_device_ratio` `2`, `device_buffer_size` `4096`, longctx `--mem-fraction-static` `0.88`.
 
+## Amendments during execution
+
+The plan changed while it was being executed. Each entry says what changed and why, so the
+committed artifact matches what was actually built.
+
+1. **Task 3b inserted** (complete, `592d743`). The baseline showed Task 5's original
+   success criterion was already satisfied before any change. See the Task 3b section for
+   the full reasoning and the measured control. Task 5 Steps 4b and 5 were rewritten
+   around it. Approved by the human partner.
+2. **Baseline numbers corrected.** Measured conc-32 throughput is **2087.1 tok/s** and
+   conc-1 decode **150.6 tok/s** (Task 3, `2a01582`). The 1975.0 / 150.0 figures quoted in
+   `dynamo/README.md` are stale; Task 10 corrects them. Compare against the measured
+   values, not the documented ones.
+3. **`cached_tokens` is available.** Task 2's smoke test confirmed the Dynamo frontend
+   populates `usage.prompt_tokens_details.cached_tokens`. Every cache-related criterion
+   should lead with that direct count and treat TTFT as corroboration, since timing is
+   noisy and load-dependent. This was not known when the plan was written.
+4. **YAML anchor for the two worker services** (human ruling). Tasks 4 and 8 use
+   `x-worker-base: &worker-base` carrying the eight identical service keys (`image`,
+   `network_mode`, `gpus`, `ipc`, `ulimits`, `depends_on`, `entrypoint`, `restart`), with
+   each service spelling out only its own `profiles`, `environment`, `volumes`, and
+   `command`. Task 4 introduces the anchor since it already edits `worker`; Task 8
+   consumes it. This overrides the fully-duplicated service block written out in Task 8.
+5. **Task 1's exception branches diverge from the code printed in Task 1 Step 4.** Review
+   found the printed `reap()` fails to decrement `total` on `FileNotFoundError`, which
+   over-evicts under overlapping cron runs. Shipped code decrements `total` on
+   `FileNotFoundError` (space genuinely freed) without crediting `removed`/`reclaimed`,
+   and leaves the general `OSError` path undecremented (file still present). The shipped
+   behaviour is correct; the code block in Step 4 is not. Commits `8eec6da`, `cc01e9f`.
+
 ## Deviation from the spec
 
 The spec names the reaper `dynamo/kv_reaper.sh` (bash). This plan implements `dynamo/kv_reaper.py` (stdlib Python) instead. Reason: the reaper recursively deletes files on a 28 TB volume and its safety guards (never escape the root, never follow symlinks, refuse shallow paths) are the part most worth testing — and this host has neither `shellcheck` nor `bats`, while pytest 9.0.3 is present. Python also matches `bench_stream.py`, the repo's existing CLI style.
@@ -793,6 +823,29 @@ the prefix reuse that already exists rather than just a cold prefill."
 
 ---
 
+### Task 3b: Baseline eviction-pressure control — ADDED MID-EXECUTION
+
+**Status: COMPLETE (commit `592d743`).** Recorded here so the plan matches what was actually done.
+
+**Why it was added.** Task 3's baseline showed the GPU radix cache alone already delivers 25.9× warm-prefix TTFT (16,677 ms → 644 ms) at 99.9% cached tokens. Task 5's original criterion — "pass-2 TTFT at least 5× better than pass 1" — was therefore *already satisfied before any change*, and would have passed trivially while proving nothing. Profile A's actual value is capacity and persistence, not warm TTFT, so the test had to become one the tiers can genuinely fail. Human ruling approved the change.
+
+**Why it had to run before Task 4/5.** Task 5 restarts the worker. Once that happens the pre-change comparison is unrecoverable, so the baseline half of the eviction test had to be captured while the stack was still in its original configuration.
+
+**Method.** Prime a 131,072-token prefix (seed 1234), confirm it is warm, then flood with 5 distinct 131K prefixes (seeds 2–6 = 655,360 tokens) to push it out of the 540,800-token GPU pool, then re-request it. Five seeds rather than four: four would force only ~115K of eviction against a 131K prefix, leaving a partial hit and an ambiguous result.
+
+**Measured baseline result:**
+
+| Step | TTFT | Cached tokens |
+|---|---|---|
+| Warm, pre-flood | 665 ms | 100.0% |
+| Recheck, post-flood | **16,769 ms** | **0%** |
+
+Prefix A fully evicted. This is the number Task 5 Step 4b must beat.
+
+One benign anomaly, recorded in `dynamo/RESULTS-kv-tiering.md`: the prime step returned warm (723 ms) because seed 1234 was still cached from Task 3's own prefix run — no restart had intervened. The warm-confirmation step independently establishes the pre-flood state, and all five flood requests were genuinely cold (16,641–16,841 ms), so the measurement stands.
+
+---
+
 ### Task 4: Profile A configuration
 
 **Files:**
@@ -1008,10 +1061,32 @@ Expected: used memory around 1.0–1.1 TB with >1 TB still available; the `/scra
     --shared-prefix-tokens 131072 --max-tokens 32 --tag hicache-prefix
 ```
 
+- [ ] **Step 4b: Re-run the eviction-pressure sequence — the decisive test**
+
+Identical to Task 3b, so the two are directly comparable:
+
+```bash
+cd /home/users/wrightda/src/GLM-5.2-FP8/dynamo
+./bench_stream.py --shared-prefix-tokens 131072 --prefix-seed 1234 \
+    --num 1 --concurrency 1 --max-tokens 32 --tag evict-hicache-prime
+./bench_stream.py --shared-prefix-tokens 131072 --prefix-seed 1234 \
+    --num 1 --concurrency 1 --max-tokens 32 --tag evict-hicache-warm
+for s in 2 3 4 5 6; do
+  ./bench_stream.py --shared-prefix-tokens 131072 --prefix-seed $s \
+      --num 1 --concurrency 1 --max-tokens 32 --tag evict-hicache-flood-seed$s
+done
+./bench_stream.py --shared-prefix-tokens 131072 --prefix-seed 1234 \
+    --num 1 --concurrency 1 --max-tokens 32 --tag evict-hicache-recheck
+```
+
+Note the worker was restarted in Step 1, so unlike Task 3b the prime here starts genuinely cold.
+
 - [ ] **Step 5: Judge against the spec's criteria**
 
-- **No cold-path regression:** conc-32 system tok/s within 5% of the Task 3 baseline, and conc-1 decode tok/s within 5%. Tiering must be free when it misses.
-- **Warm-prefix TTFT:** pass-2 TTFT at least 5× better than pass 1, and better than the Task 3 radix-only prefix run.
+- **No cold-path regression:** conc-32 system tok/s within 5% of **2087.1** and conc-1 decode tok/s within 5% of **150.6** — the Task 3 measured baseline. (The 1975.0 / 150.0 figures in `dynamo/README.md` are stale; do not compare against them.) Tiering must be free when it misses.
+- **Eviction survival — THE decisive criterion.** Compare Step 4b's final recheck against the Task 3b baseline, where an evicted 131K prefix cost **16,769 ms at 0% cached tokens**. Profile A must do materially better: substantially lower TTFT and, above all, a **non-zero `cached tokens mean`**, which is direct proof the prefix was served from L2/L3 rather than recomputed. Lead with the cached-token count; TTFT is corroboration, since it is noisy and load-dependent.
+  - If the recheck is also ~16.8 s at 0% cached, **the tiering is not doing anything** and neither L2 nor L3 has earned its place. Say so plainly rather than defending the design.
+- **Warm-prefix TTFT is NOT a criterion.** The Task 3 baseline already achieves 25.9× (16,677 ms → 644 ms) and 99.9% cached tokens on `--passes 2` using the GPU radix cache alone. Any bar based on it passes trivially and proves nothing. Record the number for completeness; do not treat it as evidence for or against Profile A.
 - Check `/scratch` actually grew: `du -sh /scratch/kvcache/glm52`. If it is still empty, the L3 tier is not being written and Task 6 cannot pass — investigate before proceeding.
 - **Watch for write amplification on the deduped key.** All 8 TP ranks address one storage key per page (no `tp_rank` suffix for MLA), so they may all write it. During the conc-32 run, sample `iostat -x 5 3` or compare `du -sh` before and after: if `/scratch` grows at roughly 8× the unique-token rate, the ranks are not coordinating and the write path needs `write_through_selective`. Record either way.
 

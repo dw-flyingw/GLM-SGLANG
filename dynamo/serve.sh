@@ -24,6 +24,14 @@ if [ "${PROFILE}" = "cache" ]; then
   KV_SCRATCH_ROOT="${KV_SCRATCH_ROOT:-/scratch/kvcache}"
   KV_SCRATCH_DIR="${KV_SCRATCH_DIR:-/scratch/kvcache/glm52}"
 
+  # Normalize both paths before the prefix check below. realpath -m collapses
+  # '..' traversal and does not require the path to exist, so
+  # KV_SCRATCH_DIR=/scratch/kvcache/../../tmp/evil can no longer pass the
+  # check by textually starting with KV_SCRATCH_ROOT while actually
+  # resolving outside it.
+  KV_SCRATCH_ROOT="$(realpath -m "${KV_SCRATCH_ROOT}")"
+  KV_SCRATCH_DIR="$(realpath -m "${KV_SCRATCH_DIR}")"
+
   # Only KV_SCRATCH_ROOT is bind-mounted into the container (see docker-compose.yml).
   # If KV_SCRATCH_DIR is overridden to somewhere outside it, the directory is absent
   # inside the container and SGLang's os.makedirs() silently writes an unbounded
@@ -113,11 +121,17 @@ fi
 echo "Starting Dynamo (SGLang) stack for GLM-5.2-FP8 [profile: ${PROFILE}] ..."
 docker compose --profile "${PROFILE}" up -d
 
+if [ "${PROFILE}" = "longctx" ]; then
+  WORKER_SERVICE="worker-longctx"
+else
+  WORKER_SERVICE="worker"
+fi
+
 cat <<EOF
 
 Up. The model load + NSA/MTP warmup takes several minutes (756 GB of weights).
 
-  Follow worker startup:   docker compose -f $(pwd)/docker-compose.yml logs -f worker
+  Follow worker startup:   docker compose -f $(pwd)/docker-compose.yml logs -f ${WORKER_SERVICE}
   Frontend logs:           docker compose -f $(pwd)/docker-compose.yml logs -f frontend
   Stop everything:         ./stop.sh
 

@@ -125,7 +125,7 @@ prefix:
 |---|---:|---:|
 | Before tiering (plain GPU radix cache only) | **16,769 ms** | 0 / 135,271 (0%) |
 | After tiering (`write_through`, same eviction test) | **1,230 ms** | 135,232 / 135,271 (100%) |
-| After tiering **and a worker restart** (L2 host RAM freshly reallocated and confirmed empty at boot) | **5,121 ms** | 135,232 / 135,271 (100%) |
+| Restart-persistence test (**separate run**, fresh 131K-token prefix, seed 4242, no flood): after tiering **and a worker restart** (L2 host RAM freshly reallocated and confirmed empty at boot) | **5,121 ms** | 135,232 / 135,257 (100%) |
 
 The third row is the proof `/scratch` — not host RAM — served the prefix:
 L2 is wiped on every worker restart (8 fresh `Allocating 96.00 GB host
@@ -297,14 +297,15 @@ The worker's tiered KV cache (`--hicache-storage-backend=file`, `KV_SCRATCH_DIR`
 writing to `/scratch/kvcache/glm52`) has **no eviction and no size cap** — SGLang's
 `file` backend just keeps writing one `.bin` per page component forever. Left alone
 it grows without bound until the 28 TB `/scratch` volume fills and the worker starts
-failing writes. `dynamo/kv_reaper.py` (Task 1, 19 tests) enforces a byte budget on
+failing writes. `dynamo/kv_reaper.py` (19 tests) enforces a byte budget on
 that directory, deleting the oldest files first until the tree fits.
 
 **Schedule** — a user crontab entry, no sudo required (the invoking user owns
-`/scratch/kvcache`):
+`/scratch/kvcache`). Crontab entries need an absolute path, so substitute
+your actual checkout location for `/path/to/GLM-5.2-FP8` below:
 
 ```cron
-*/15 * * * * /home/users/wrightda/src/GLM-5.2-FP8/dynamo/kv_reaper.py --root /scratch/kvcache/glm52 --max-bytes 10TB >> /scratch/kvcache/reaper.log 2>&1
+*/15 * * * * /path/to/GLM-5.2-FP8/dynamo/kv_reaper.py --root /scratch/kvcache/glm52 --max-bytes 10TB >> /scratch/kvcache/reaper.log 2>&1
 ```
 
 Install with `crontab -e` (interactive; not automatable). The log is written to
@@ -320,7 +321,7 @@ Install with `crontab -e` (interactive; not automatable). The log is written to
   eviction.
 - **Deleting under a live worker is safe.** Every file in the tree is a regenerable
   cache entry — a miss just falls back to recompute (or a lower cache tier). This
-  was validated directly: a file owned by the container's uid (1000, `tux`) was
+  was validated directly: a file owned by the container's uid (1000) was
   deleted by the host user while the worker was live and serving, and the deletion
   succeeded and stuck. The containing directory is `0777` with no sticky bit, so
   POSIX only requires write+execute on the directory (which the host user has), not

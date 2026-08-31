@@ -27,6 +27,14 @@ import urllib.request
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 MODEL = os.environ.get("MODEL", "glm-5.2-fp8")
 
+# Generous on purpose: a cold 131K-token prefill legitimately takes ~20 s
+# (see --shared-prefix-tokens runs), and a large --max-tokens decode pass at
+# high concurrency can run for minutes. Without a timeout at all, one hung
+# request wedges urlopen()'s thread forever and the whole benchmark pass
+# (run_pass joins every thread) never returns. Override via env for unusually
+# slow scenarios; do not set this below ~300s.
+REQUEST_TIMEOUT_S = float(os.environ.get("BENCH_STREAM_TIMEOUT_S", "300"))
+
 # A fixed, deterministic prompt so OFF vs ON see identical work. Asks for a
 # sized output so decode (where MTP helps) dominates over prefill.
 PROMPT = (
@@ -105,7 +113,7 @@ def one_request(prompt, max_tokens, no_think):
     prompt_tokens = None
     cached_tokens = None
     chunk_count = 0
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
         for raw in resp:
             line = raw.decode("utf-8").strip()
             if not line.startswith("data:"):

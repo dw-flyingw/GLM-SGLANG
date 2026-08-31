@@ -1,5 +1,6 @@
 import os
 import pathlib
+import sys
 
 import pytest
 
@@ -108,8 +109,12 @@ def test_filenotfounderror_does_not_over_evict(kv_reaper, tmp_path, monkeypatch)
 
     Four 100-byte files with increasing mtimes, budget 250 (so two must be
     deleted). Simulate the oldest vanishing before reap reaches it via
-    monkeypatch. Without the fix, reap would delete three files (over-evict).
-    With the fix, it deletes exactly two and the two newest survive.
+    monkeypatch. Without the fix (FileNotFoundError not decrementing total,
+    i.e. treated like a plain OSError), reap makes three unlink attempts
+    (oldest.bin, old.bin, new.bin) but only two files are actually deleted
+    (old.bin and new.bin) -- oldest.bin was already gone, so it evicts one
+    file further than necessary. With the fix, it deletes exactly one
+    (old.bin) and the two newest survive.
     """
     root = tmp_path / "scratch" / "kvcache"
     _write(root / "oldest.bin", 100, 1000)
@@ -171,3 +176,40 @@ def test_undeletable_file_still_counts_against_the_budget(kv_reaper, tmp_path, m
     assert reclaimed == 300, "must reclaim 300 bytes (3 * 100)"
     assert (root / "f0.bin").exists(), "undeletable f0 must survive"
     assert not (root / "f3.bin").exists(), "even newest file f3 must be deleted to compensate"
+
+
+def test_main_warns_and_exits_nonzero_when_every_delete_fails(
+    kv_reaper, tmp_path, monkeypatch, capsys
+):
+    """If the tree is over budget and every unlink fails, main() must not
+    report a quiet success (identical to the healthy under-budget case) --
+    cron needs a real failure signal or /scratch silently fills.
+
+    Two 100-byte files, budget 100 (one must go), but unlink always raises.
+    reap() returns (0, 0) -- same value as a genuinely under-budget run --
+    so main() must distinguish the two some other way (by checking whether
+    the tree is still over budget after the run) and exit non-zero with a
+    stderr warning in the over-budget case.
+    """
+    root = tmp_path / "scratch" / "kvcache"
+    _write(root / "old.bin", 100, 1000)
+    _write(root / "new.bin", 100, 2000)
+
+    def patched_unlink(self):
+        raise PermissionError("cannot delete")
+
+    monkeypatch.setattr(pathlib.Path, "unlink", patched_unlink)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["kv_reaper", "--root", str(root), "--max-bytes", "100"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        kv_reaper.main()
+    assert exc_info.value.code != 0, "must exit non-zero, unlike the healthy under-budget case"
+
+    captured = capsys.readouterr()
+    assert "removed 0 files" in captured.out
+    assert "over budget" in captured.err.lower()
+    assert (root / "old.bin").exists()
+    assert (root / "new.bin").exists()

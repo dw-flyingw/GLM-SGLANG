@@ -26,7 +26,7 @@ container's uid 1000, not just the host user** before the first start:
 ```bash
 sudo mkdir -p /scratch/kvcache/glm52
 sudo chown -R 1000:$(id -g) /scratch/kvcache
-sudo chmod -R 2775 /scratch/kvcache        # current live state: 0777 on /scratch/kvcache/glm52
+sudo chmod -R 0777 /scratch/kvcache        # container (uid 1000) must be able to write it
 ```
 
 A fresh clone following a naive `chown $(id -u)` (host user, not uid 1000) will
@@ -52,7 +52,11 @@ auto-selected DSA attention backend (`flashmla_kv` on Hopper+fp8), fp8 KV cache,
 default `PROFILE=cache`, context is served at **512K** (`--context-length
 524288`) with a tiered prefix cache (GPU radix → host RAM → `/scratch`
 NVMe) so that evicted prefixes can still be served from cache instead of
-recomputed. The model's 1M max is not servable on one node with full
+recomputed. That protection is not free: measured conc-32 system throughput
+drops to **1905.2 tok/s from a 2087.1 tok/s baseline (~9%)** under the
+default write policy, while conc-1 decode is unaffected (149.8 vs 150.6
+tok/s) — see [`dynamo/README.md`](dynamo/README.md#tiered-kv-cache) for the
+full breakdown. The model's 1M max is not servable on one node with full
 fidelity: the measured KV pool tops out at ~541K tokens alongside the
 weights, and `PROFILE=longctx` — the single-node attempt at the full 1M
 context via SGLang HiSparse — fails to initialize on this hardware (see

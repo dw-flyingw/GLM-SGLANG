@@ -124,6 +124,25 @@ def main():
     print(f"kv_reaper: {root} {prefix} {removed} files, "
           f"{reclaimed / 1e9:.1f} GB (budget {args.max_bytes / 1e12:.1f} TB)")
 
+    # A real (non-dry) run can finish still over budget if some files could
+    # not be deleted (permission errors, etc) -- most starkly when every
+    # unlink fails and reap() returns (0, 0), which is otherwise
+    # indistinguishable from the healthy "already under budget" case. Cron
+    # must see a failure here, not a quiet "removed 0 files" success, or
+    # /scratch fills with nobody the wiser. (Skipped for --dry-run: nothing
+    # was actually deleted there, so "still over budget" is expected and not
+    # a signal of anything broken.)
+    if not args.dry_run:
+        remaining = sum(size for _mtime, size, _path in collect_files(root))
+        if remaining > args.max_bytes:
+            sys.stderr.write(
+                f"kv_reaper: STILL OVER BUDGET after reaping: {remaining / 1e9:.1f} GB "
+                f"under {root} exceeds the {args.max_bytes / 1e12:.1f} TB budget even "
+                f"after deleting {removed} file(s) -- some files could not be removed "
+                f"(see 'cannot remove' lines above). /scratch will keep filling.\n"
+            )
+            sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

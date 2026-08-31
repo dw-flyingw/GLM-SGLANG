@@ -23,7 +23,7 @@ x-dynamo-env: &dynamo-env
   NATS_SERVER: "nats://localhost:4222"
 
 # Shared base for SGLang worker services (Profile A "cache" below; Profile B
-# "longctx" is added alongside it in a later task). YAML merge (<<:) replaces
+# "longctx" is added alongside it on this branch). YAML merge (<<:) replaces
 # whole keys wholesale, so profiles/environment/volumes/command stay spelled
 # out explicitly in each worker service rather than living here.
 x-worker-base: &worker-base
@@ -90,7 +90,7 @@ services:
       <<: *dynamo-env
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
-      # HiCacheFile defaults to /tmp/hicache -- the 446 GB ROOT filesystem --
+      # HiCacheFile defaults to /tmp/hicache -- the 438 GB ROOT filesystem --
       # if this is unset, which would fill the boot disk. Setting it is not
       # optional. serve.sh fails fast if the directory is missing.
       SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR: "${KV_SCRATCH_DIR:-/scratch/kvcache/glm52}"
@@ -171,12 +171,25 @@ services:
   # Profile B: HiSparse long-context worker. GPU holds the DSA indexer at the
   # FULL logical size (index_buf_size = size * host_to_device_ratio) while only
   # a working set of the heavy MLA latent KV stays resident, the rest paging
-  # from host RAM. That is what raises the servable context past 512K.
+  # from host RAM. That is the design that would raise the servable context
+  # past 512K -- IF it started.
   #
-  # THE COST IS PREFIX CACHING, ENTIRELY. HiSparse asserts --disable-radix-cache,
-  # so every request re-prefills from zero. This is the wrong default for
-  # multi-turn, shared-prompt, and batch-corpus workloads alike -- hence a
-  # separate profile rather than a flag.
+  # IT DOES NOT START ON THIS HARDWARE. Measured 2026-08-31, three attempts
+  # (default mem-fraction 0.88, reduced mem-fraction 0.86, reduced
+  # cuda-graph-max-bs) all hit CUDA OOM during CUDA-graph capture; none
+  # reached a registered state. Full logs: RESULTS-kv-tiering.md, section
+  # "Profile B (hisparse, long context)"; summary: dynamo/README.md, section
+  # "Tiered KV cache". The untried lever is a smaller --context-length for
+  # this profile -- the indexer's own graph-capture working set scales with
+  # HiSparse's addressable range (currently the full 1,048,576-token target),
+  # not with concurrency, which is why graph-count and mem-fraction tuning
+  # alone cannot close the gap. See the `--mem-fraction-static` and
+  # `--cuda-graph-max-bs` comments below for the three attempts in detail.
+  #
+  # THE COST IS PREFIX CACHING, ENTIRELY, even setting the OOM aside. HiSparse
+  # asserts --disable-radix-cache, so every request re-prefills from zero.
+  # This is the wrong default for multi-turn, shared-prompt, and batch-corpus
+  # workloads alike -- hence a separate profile rather than a flag.
   #
   # /scratch is unused here: HiSparse has no storage backend, only GPU<->host.
   worker-longctx:
@@ -210,23 +223,38 @@ services:
       - --enable-hisparse
       - --disable-radix-cache
       - '--hisparse-config={"top_k":2048,"device_buffer_size":${HISPARSE_DEVICE_BUFFER:-4096},"host_to_device_ratio":${HISPARSE_RATIO:-2}}'
-      # Measured 2026-08-31: Profile A at --mem-fraction-static 0.85 reported
-      # available_gpu_mem=10.09 GB/GPU. Raising to 0.88 consumes ~4.3 GB more of
-      # that headroom, leaving ~5.8 GB -- feasible but tight; that is what lets
-      # the full 1,048,576-token context be addressed. dynamo/README.md warns
-      # that ~0.93 risks OOM at CUDA-graph capture, so 0.88 is not pushed further.
+      # Does NOT start on this hardware at this default. Measured 2026-08-31:
+      # Profile A at --mem-fraction-static 0.85 reports available_gpu_mem=
+      # 10.09 GB/GPU. Raising to 0.88 (this default) consumes ~4.3 GB more of
+      # that headroom, leaving ~5.8 GB -- 0.88 was chosen to leave that margin
+      # rather than pushing toward the ~0.93 ceiling the raw headroom implies.
+      # Moot in hindsight: CUDA-graph capture OOMs well below even 0.88.
+      # Attempt 1 (this 0.88 default): OOM in generic graph capture, 488 MiB
+      # free at failure (GPU 6). Attempt 2 (MEM_FRACTION_LONG=0.86): same
+      # failure mode, *more* free memory at failure (1.24 GiB, GPU 1) but not
+      # proportionally more -- freeing static memory does not translate into
+      # graph-capture headroom 1:1. See the `--cuda-graph-max-bs` comment
+      # below for attempt 3. Full logs: RESULTS-kv-tiering.md, section
+      # "Profile B (hisparse, long context)".
       - --context-length=${MAX_MODEL_LEN_LONG:-1048576}
       - --mem-fraction-static=${MEM_FRACTION_LONG:-0.88}
       # SGLang defaults cuda_graph_max_bs to 512, but --max-running-requests caps
       # concurrency at 128, so graphs for batch sizes 129-512 can never be scheduled
       # -- they are pure wasted GPU memory. That waste is affordable under Profile A
-      # and is not under Profile B: the first longctx attempt died with
+      # and is not under Profile B: longctx attempt 2 (MEM_FRACTION_LONG=0.86,
+      # see above) died with
       #   "Capture cuda graph failed: CUDA out of memory. Tried to allocate 1.31 GiB.
       #    GPU 1 has ... 1.24 GiB is free ... 1.56 GiB allocated in private pools
       #    (e.g., CUDA Graphs)"
       # i.e. it missed by ~70 MB while holding 1.56 GiB of graph pools it cannot use.
-      # Capping capture at the real concurrency ceiling reclaims that. Also shortens
-      # startup, since there are fewer graphs to capture.
+      # Capping capture at the real concurrency ceiling reclaims that -- and it
+      # does help: attempt 3 (this cap, with mem-fraction back at 0.88) got past
+      # generic graph capture entirely (host pools allocated, DeepGEMM warmup
+      # done), then OOM'd one call deeper, inside the HiSparse indexer's OWN
+      # graph capture (dsa_indexer.py::_get_topk_paged), needing 1.50 GiB with
+      # only 488 MiB free and the GPU fully pinned. That is still a failure to
+      # start -- see the header comment above for the lever that might close it.
+      # Also shortens startup, since there are fewer graphs to capture.
       - --cuda-graph-max-bs=${CUDA_GRAPH_MAX_BS_LONG:-128}
       # MTP/EAGLE is carried over UNVERIFIED: nothing in SGLang forbids it with
       # HiSparse and nothing exercises it either. If startup fails citing

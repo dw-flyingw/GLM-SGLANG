@@ -92,8 +92,14 @@ def reap(root, max_bytes, dry_run=False):
             try:
                 path.unlink()
             except FileNotFoundError:
+                # File already gone (another cron run or server eviction).
+                # Disk usage has genuinely dropped; decrement total but do not
+                # credit ourselves (removed/reclaimed report our own deletions).
+                total -= size
                 continue
             except OSError as e:
+                # File cannot be deleted (permission, I/O error, etc).
+                # It still exists and counts toward the budget. Do not decrement.
                 sys.stderr.write(f"kv_reaper: cannot remove {path}: {e}\n")
                 continue
         total -= size

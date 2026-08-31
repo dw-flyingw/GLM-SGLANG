@@ -101,3 +101,68 @@ def test_validate_root_accepts_a_deep_directory(kv_reaper, tmp_path):
 )
 def test_parse_size(kv_reaper, text, expected):
     assert kv_reaper.parse_size(text) == expected
+
+
+def test_filenotfounderror_does_not_over_evict(kv_reaper, tmp_path, monkeypatch):
+    """FileNotFoundError: file already gone, don't over-delete valid entries.
+
+    Four 100-byte files with increasing mtimes, budget 250 (so two must be
+    deleted). Simulate the oldest vanishing before reap reaches it via
+    monkeypatch. Without the fix, reap would delete three files (over-evict).
+    With the fix, it deletes exactly two and the two newest survive.
+    """
+    root = tmp_path / "scratch" / "kvcache"
+    _write(root / "oldest.bin", 100, 1000)
+    _write(root / "old.bin", 100, 2000)
+    _write(root / "new.bin", 100, 3000)
+    _write(root / "newest.bin", 100, 4000)
+
+    # Monkeypatch unlink to raise FileNotFoundError for oldest.bin
+    original_unlink = pathlib.Path.unlink
+
+    def patched_unlink(self):
+        if self.name == "oldest.bin":
+            raise FileNotFoundError("already gone")
+        return original_unlink(self)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", patched_unlink)
+
+    removed, reclaimed = kv_reaper.reap(root, max_bytes=250)
+    # Should delete exactly 1 (oldest.bin's FileNotFoundError doesn't count)
+    # and old.bin's real delete
+    assert removed == 1, "reap should only count its own deletions, not already-gone files"
+    assert reclaimed == 100, "should only credit the one file we actually deleted"
+    assert not (root / "old.bin").exists(), "old.bin should be deleted"
+    assert (root / "new.bin").exists(), "new.bin must survive"
+    assert (root / "newest.bin").exists(), "newest.bin must survive"
+
+
+def test_oserror_does_not_credit_undeletable_files(kv_reaper, tmp_path, monkeypatch):
+    """OSError: file cannot be deleted, it still counts toward budget.
+
+    Create two files. Make one undeletable (PermissionError). Reap with a
+    tight budget. Assert that the undeletable file is NOT reported as
+    reclaimed and the file survives.
+    """
+    root = tmp_path / "scratch" / "kvcache"
+    _write(root / "locked.bin", 100, 1000)
+    _write(root / "free.bin", 100, 2000)
+
+    # Monkeypatch unlink to raise PermissionError for locked.bin
+    original_unlink = pathlib.Path.unlink
+
+    def patched_unlink(self):
+        if self.name == "locked.bin":
+            raise PermissionError("cannot delete")
+        return original_unlink(self)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", patched_unlink)
+
+    removed, reclaimed = kv_reaper.reap(root, max_bytes=50)
+    # locked.bin cannot be deleted, so it still counts toward the budget.
+    # We can only delete free.bin (100 bytes), leaving 200 bytes total.
+    # This still exceeds budget, but we can't do better.
+    assert removed == 1, "should only count the one file we successfully deleted"
+    assert reclaimed == 100, "should only credit what we actually deleted"
+    assert (root / "locked.bin").exists(), "locked.bin must survive (undeletable)"
+    assert not (root / "free.bin").exists(), "free.bin should be deleted"

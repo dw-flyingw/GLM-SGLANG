@@ -163,3 +163,42 @@ the expected speculative-decoding profile.
   first start pays this cost** — later restarts on the same image/GPU reuse the cache
   and come up fast. (Removing the volume or changing the SGLang/GPU arch invalidates
   it and triggers one more recompile.)
+
+### Maintenance: the KV cache reaper
+
+The worker's tiered KV cache (`--hicache-storage-backend=file`, `KV_SCRATCH_DIR`,
+writing to `/scratch/kvcache/glm52`) has **no eviction and no size cap** — SGLang's
+`file` backend just keeps writing one `.bin` per page component forever. Left alone
+it grows without bound until the 28 TB `/scratch` volume fills and the worker starts
+failing writes. `dynamo/kv_reaper.py` (Task 1, 19 tests) enforces a byte budget on
+that directory, deleting the oldest files first until the tree fits.
+
+**Schedule** — a user crontab entry, no sudo required (the invoking user owns
+`/scratch/kvcache`):
+
+```cron
+*/15 * * * * /home/users/wrightda/src/GLM-5.2-FP8/dynamo/kv_reaper.py --root /scratch/kvcache/glm52 --max-bytes 10TB >> /scratch/kvcache/reaper.log 2>&1
+```
+
+Install with `crontab -e` (interactive; not automatable). The log is written to
+`/scratch/kvcache/reaper.log` — one level **above** the reaped root
+(`/scratch/kvcache/glm52`) — so the reaper never counts or deletes its own log.
+
+- **Budget: 10 TB of the 28 TB `/scratch` volume.** Leaves headroom for other
+  consumers of the volume and for bursts between 15-minute runs.
+- **Eviction is by mtime, not atime.** `/scratch` is mounted `relatime`, which only
+  advances atime when it is already older than mtime or older than 24h — far too
+  coarse to drive an LRU. mtime (set once, at file creation; these cache files are
+  never rewritten) approximates insertion order well enough for oldest-first
+  eviction.
+- **Deleting under a live worker is safe.** Every file in the tree is a regenerable
+  cache entry — a miss just falls back to recompute (or a lower cache tier). This
+  was validated directly: a file owned by the container's uid (1000, `tux`) was
+  deleted by the host user while the worker was live and serving, and the deletion
+  succeeded and stuck. The containing directory is `0777` with no sticky bit, so
+  POSIX only requires write+execute on the directory (which the host user has), not
+  ownership of the file.
+- **Observed growth rate:** roughly **8 GB per 131K-token prefix primed** — one
+  prime-then-warm cycle took the cache from ~47 GB to ~55 GB. At that rate the
+  10 TB budget has substantial headroom, but it's the number to use when reasoning
+  about how fast the budget fills under heavier prefix-caching workloads.

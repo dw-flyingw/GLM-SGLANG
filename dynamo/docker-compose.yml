@@ -22,6 +22,22 @@ x-dynamo-env: &dynamo-env
   ETCD_ENDPOINTS: "http://localhost:2379"
   NATS_SERVER: "nats://localhost:4222"
 
+# Shared base for SGLang worker services (Profile A "cache" below; Profile B
+# "longctx" is added alongside it in a later task). YAML merge (<<:) replaces
+# whole keys wholesale, so profiles/environment/volumes/command stay spelled
+# out explicitly in each worker service rather than living here.
+x-worker-base: &worker-base
+  image: ${DYNAMO_IMAGE:-glm52-dynamo-sglang:0.5.13post1}
+  network_mode: host
+  gpus: all
+  ipc: host
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  depends_on: [etcd, nats]
+  entrypoint: ["python3", "-m", "dynamo.sglang"]
+  restart: "no"
+
 services:
   etcd:
     image: quay.io/coreos/etcd:v3.5.21
@@ -65,17 +81,19 @@ services:
 
   # Aggregated worker: full model, tensor-parallel over all 8 GPUs (TP=8) + MTP.
   worker:
-    image: ${DYNAMO_IMAGE:-glm52-dynamo-sglang:0.5.13post1}
-    network_mode: host
-    gpus: all
-    ipc: host
-    ulimits:
-      memlock: -1
-      stack: 67108864
+    <<: *worker-base
+    # Profile A: tiered KV cache (GPU radix -> host RAM L2 -> /scratch L3).
+    # Mutually exclusive with worker-longctx: SGLang forbids hierarchical cache
+    # together with --disable-radix-cache, which HiSparse requires.
+    profiles: ["cache"]
     environment:
       <<: *dynamo-env
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
+      # HiCacheFile defaults to /tmp/hicache -- the 446 GB ROOT filesystem --
+      # if this is unset, which would fill the boot disk. Setting it is not
+      # optional. serve.sh fails fast if the directory is missing.
+      SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR: "${KV_SCRATCH_DIR:-/scratch/kvcache/glm52}"
     volumes:
       - "${HF_CACHE:-/root/.cache/huggingface}:${HF_CACHE:-/root/.cache/huggingface}"
       # Persist JIT-compiled kernels (DeepGEMM, FlashInfer, Triton, tvm-ffi) across
@@ -83,8 +101,9 @@ services:
       # warmup. The cache dir exists in the image owned by the 'dynamo' user, so the
       # named volume inherits that ownership on first mount (writes succeed).
       - "dynamo-jit-cache:/home/dynamo/.cache"
-    depends_on: [etcd, nats]
-    entrypoint: ["python3", "-m", "dynamo.sglang"]
+      # L3 KV tier. Separate NVMe devices from /data (the weight cache), so
+      # cache I/O does not contend with weight loading.
+      - "${KV_SCRATCH_ROOT:-/scratch/kvcache}:${KV_SCRATCH_ROOT:-/scratch/kvcache}"
     # SGLang engine args pass straight through. We let SGLang AUTO-SELECT the DSA
     # attention backend (no --attention-backend): on Hopper with fp8 KV it picks
     # flashmla_kv for prefill+decode. Parsers are the Dynamo-side (frontend) parsers.
@@ -118,7 +137,30 @@ services:
       - --speculative-num-steps=${SPEC_NUM_STEPS:-2}
       - --speculative-eagle-topk=${SPEC_EAGLE_TOPK:-1}
       - --speculative-num-draft-tokens=${SPEC_NUM_DRAFT:-3}
-    restart: "no"
+      # --- Tiered KV cache -------------------------------------------------
+      # See docs/superpowers/specs/2026-08-31-scratch-kv-cache-tiering-design.md
+      #
+      # --hicache-size is PER TP RANK: HostKVCache.__init__ reads it as this
+      # rank's own pool (host_size * 1e9 // size_per_token), so TP=8 allocates
+      # it EIGHT times -- MLA makes all eight copies identical, but they are
+      # still eight allocations. 96 GB/rank => ~770 GB of MLA host pool plus
+      # ~22 GB/rank of DSA indexer host pool = ~944 GB of the ~2168 GB free.
+      # SGLang hard-fails at startup if it over-requests, so raising this is
+      # fail-safe, not fail-dangerous.
+      - --enable-hierarchical-cache
+      - --hicache-size=${HICACHE_GB:-96}
+      - --hicache-write-policy=write_through
+      # `kernel` I/O survives here: it is only downgraded to `direct` when the
+      # effective DECODE backend is fa3, and ours is the auto-selected
+      # dsa/flashmla_kv. Verify from the startup log rather than trusting this.
+      - --hicache-io-backend=kernel
+      - --hicache-mem-layout=page_first
+      # The `file` backend deduplicates across TP ranks for MLA models (storage
+      # keys carry no tp_rank suffix), so /scratch holds ONE copy, not eight.
+      # That dedup is why the disk tier holds ~85x more unique tokens than all
+      # of host RAM. It has no eviction -- see dynamo/kv_reaper.py.
+      - --hicache-storage-backend=file
+      - --hicache-storage-prefetch-policy=timeout
 
 volumes:
   etcd-data:

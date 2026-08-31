@@ -308,3 +308,122 @@ For reference, the flood requests (seeds 2-6, all genuinely cold, not resident b
 
 **Conclusion:** Prefix A (seed 1234) was successfully and fully evicted from the GPU radix cache by flooding with 655,360 tokens (5 x 131,072) of distinct content against the 540,800-token pool. Re-requesting A after the flood cost the same ~16.8 s cold-prefill penalty as a never-before-seen prefix, with 0% cache reuse. This is the baseline the KV-cache tiering feature must improve on: a later task will re-run this identical prime/warm/flood/recheck sequence with tiering enabled and should show step 4 landing much closer to the ~650 ms warm numbers in steps 1/2 rather than the ~16.8 s cold number measured here.
 
+
+## Profile A (hicache, /scratch L3)
+
+Date: 2026-08-31. **BLOCKED — could not bring the worker up. No benchmarks were run.**
+
+### Summary (top line)
+
+Task 5 could not be completed. Step 1 ("Restart the stack under Profile A") failed: the `dynamo-worker-1` container will not start under **any** profile, **any** configuration, on this host right now. This is a pre-existing, host-level infrastructure fault, unrelated to the KV-cache-tiering branch or to `PROFILE=cache`/hicache config — it would block a plain restart of the pre-tiering baseline just as completely. It was not visible before this task because the previously-running worker container (up since 2026-08-10, used for every measurement in the `## Baseline` sections above) was created *before* the fault occurred and kept running through it; stopping it (as Step 1 instructs) exposed the problem for the first time.
+
+**Root cause:** on 2026-08-11 06:47:54 UTC, host package `nvidia-fabricmanager` (and the `nvidia-driver` meta-package) were upgraded from 590.48.01 to 595.71.05, but the running kernel never reloaded the new kernel module (no reboot occurred). The currently *loaded* kernel module is still 590.48.01 (`cat /proc/driver/nvidia/version`), while all userspace NVIDIA tooling (`nvidia-smi`, `nv-fabricmanager`) is now 595.71.05. `nvidia-fabricmanager-590` is a transitional dummy package with no real binary (depends on `-595`) — there is no way to run a 590 fabric manager anymore. `nvidia-fabricmanager.service` has been crash-looping/dead since that moment:
+
+```
+Aug 11 06:47:54 sprocket nv-fabricmanager[186868]: fabric manager NVIDIA GPU driver interface version 595.71.05 don't match with driver version 590.48.01. Please update with matching NVIDIA driver package.
+Aug 11 06:47:54 sprocket nvidia-fabricmanager-start.sh[186855]: "/usr/bin/nv-fabricmanager -c /usr/share/nvidia/nvswitch/fabricmanager.cfg" failed! Exit code: 1
+Aug 11 06:47:54 sprocket systemd[1]: nvidia-fabricmanager.service: Failed with result 'exit-code'.
+```
+
+Because the fabric manager socket (`/run/nvidia-fabricmanager/socket`) is never created, Docker's NVIDIA container runtime — which unconditionally bind-mounts that socket into any container requesting GPU access on this NVSwitch system — fails at container-create time for **any** new GPU container:
+
+```
+$ PROFILE=cache ./serve.sh
+...
+Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed:
+runc create failed: unable to start container process: error during container init: failed to fulfil mount request:
+open /run/nvidia-fabricmanager/socket: no such file or directory
+```
+
+Reproduced twice (once via `./serve.sh`, once via `docker compose --profile cache up -d worker` directly) — not transient.
+
+`nvidia-smi` on the host also fails outright right now, independent of this task:
+
+```
+$ nvidia-smi --query-gpu=index,name,driver_version --format=csv
+Failed to initialize NVML: Driver/library version mismatch
+```
+
+### What was verified (diagnostic only, no fix applied)
+
+- `dpkg -l | grep -iE 'fabricmanager|nvidia-driver'`: both `nvidia-driver-590-server-open` (590.48.01) and `nvidia-driver-595-server-open` (595.71.05) show `ii` installed; `nvidia-fabricmanager-595` (real binary) and `nvidia-fabricmanager-590` (empty transitional package, `Depends: nvidia-fabricmanager-595`) both `ii`.
+- `cat /proc/driver/nvidia/version`: `NVRM version: ... 590.48.01 ...` — confirms the loaded kernel module is still 590.
+- `dkms status`: `nvidia/595.71.05, 6.8.0-137-generic, x86_64: installed` — the matching 595 module **is** built and present for the running kernel; it has just never been loaded.
+- `fuser -v /dev/nvidia*` and `lsof /dev/nvidia0`: both empty — no process currently holds any GPU (expected, since I had already stopped the only worker that was using them). This means the underlying fault could plausibly be cleared by a kernel-module reload without a full reboot, but doing that is host driver surgery on a shared 8x H200 production box, well outside this task's authorized actions (`stop.sh`/`serve.sh`, no source edits) — **I deliberately did not attempt it** and am reporting instead, per this task's own instruction to "say so loudly... and leave clear instructions" rather than improvise a fix outside scope.
+- `/etc/nvidia-container-runtime/config.toml` has no toggle to skip the fabricmanager socket mount specifically; this is baked into libnvidia-container's NVSwitch-detection logic, not configurable per-container.
+
+### Current live state (left as-is; NOT torn down)
+
+```
+$ docker compose ps -a
+NAME                IMAGE                             COMMAND                  SERVICE    STATUS
+dynamo-etcd-1       quay.io/coreos/etcd:v3.5.21       "etcd --data-dir=/et…"   etcd       Up
+dynamo-frontend-1   glm52-dynamo-sglang:0.5.13post1   "python3 -m dynamo.f…"   frontend   Up
+dynamo-nats-1       nats:2.10-alpine                  "docker-entrypoint.s…"   nats       Up
+dynamo-worker-1     glm52-dynamo-sglang:0.5.13post1   "python3 -m dynamo.s…"   worker     Created   (never started; no logs)
+
+$ curl -s http://localhost:8000/v1/models
+{"object":"list","data":[]}       # frontend up, zero workers registered -- NOT serving completions
+
+$ free -g
+               total        used        free      shared  buff/cache   available
+Mem:            2267          40        1513           0         724        2227
+
+$ du -sh /scratch/kvcache/glm52
+0	/scratch/kvcache/glm52     # unchanged/empty -- nothing ever ran against it
+```
+
+**The stack is NOT fully up.** `etcd`/`nats`/`frontend` are running (frontend answers HTTP but has zero registered workers), but `dynamo-worker-1` never started and holds no GPUs. The model is **not serving**. This does not satisfy the "always leave the stack UP" requirement — it could not be satisfied given the host fault, and is reported here plainly rather than glossed over.
+
+### Remediation needed (requires a human with host root / sudo)
+
+Either of:
+1. **Reboot the host** (cleanest — completes the pending 590→595 driver activation cleanly), then `cd dynamo && PROFILE=cache ./serve.sh`.
+2. **Without a reboot**, since GPUs are currently idle and the matching 595.71.05 DKMS module is already built for the running kernel (`6.8.0-137-generic`):
+   ```
+   sudo rmmod nvidia_drm nvidia_modeset nvidia_uvm nvidia
+   sudo modprobe nvidia nvidia_uvm nvidia_modeset nvidia_drm
+   sudo systemctl start nvidia-fabricmanager
+   systemctl status nvidia-fabricmanager   # confirm "Successfully configured all the available NVSwitches"
+   nvidia-smi                              # confirm it reports 595.71.05 with no mismatch
+   cd dynamo && PROFILE=cache ./serve.sh
+   ```
+   This was **not attempted** by this task — it requires root and is outside `stop.sh`/`serve.sh`, so it was left for a human to run and verify.
+
+Once the worker is confirmed registered and healthy, Task 5's Steps 2 through 6 (log assertions, `free -g`/`du -sh` before/after, the three benchmarks, and the decisive eviction-recheck test) still need to be executed — none of them ran here.
+
+### PASS/FAIL against Task 5's criteria
+
+| Criterion | Result |
+|---|---|
+| Worker registers under `PROFILE=cache` | **FAIL** — never started, host GPU/driver fault |
+| Step 2 log assertions (hicache host alloc, DSA indexer alloc, page_first/kernel, max_total_num_tokens=540800, DSA/flashmla_kv backend) | **NOT EXECUTED** — no worker logs exist |
+| No cold-path regression (conc-1 ≥ ~150.6 tok/s ×0.95, conc-32 ≥ ~2087.1 tok/s ×0.95) | **NOT EXECUTED** |
+| Eviction survival (non-zero cached-token %, TTFT materially below 16,769 ms) | **NOT EXECUTED** — the decisive test did not run |
+| `/scratch` grows (L3 tier being written) | **NOT EXECUTED** / confirmed empty (0 bytes), unchanged |
+| Stack left UP on PROFILE=cache | **FAIL** — worker not running; frontend/etcd/nats up but zero workers registered, not serving |
+
+**This is a blocked/incomplete task, not a negative result on the tiering feature itself.** Nothing about Profile A's hicache configuration was exercised or disproven — the blocker is a dormant, 3-week-old, unrelated host driver upgrade that was never completed. Task 5 needs to be re-run in full once a human clears the driver mismatch above.
+
+### RESOLUTION (2026-08-31, after the above was written)
+
+The fault was repaired without a reboot. Three artifacts of the 590->595 upgrade were stale
+and all three had to be refreshed:
+
+1. **Kernel module** — unloaded the 590.48.01 module and loaded the 595.71.05 one DKMS had
+   already built for the running kernel 6.8.0-137-generic:
+   `rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && modprobe nvidia && modprobe nvidia_uvm`
+   Module refcounts were verified 0 first; no GPU processes were running.
+2. **Fabric Manager** — started cleanly once the module matched. `/run/nvidia-fabricmanager/socket`
+   reappeared and `nvidia-smi` began working again (8x H200 visible, NVRM 595.71.05).
+3. **CDI spec** — `/run/cdi/nvidia.yaml` was still the spec generated at the 2026-08-10 boot
+   and named 590 library files. This one was NOT repaired: attempts to regenerate it did not
+   take. Instead `docker-compose.yml` now pins `runtime: nvidia` (legacy path) instead of
+   `gpus: all` (which resolves through CDI under `mode="auto"`). See commit 852de86.
+
+**Outstanding host debt:** `/run/cdi/nvidia.yaml` still contains 91 references to 590.48.01.
+Any *other* CDI-based GPU container on sprocket will still fail. It regenerates correctly on
+the next reboot (/run is tmpfs). The `runtime: nvidia` pin in docker-compose.yml is a
+workaround and should be reverted to `gpus: all` once the host is repaired.
+
+After the repair the worker started, loaded, and registered normally. Benchmarks follow below.

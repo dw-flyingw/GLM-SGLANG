@@ -320,9 +320,9 @@ Task 5 could not be completed. Step 1 ("Restart the stack under Profile A") fail
 **Root cause:** on 2026-08-11 06:47:54 UTC, host package `nvidia-fabricmanager` (and the `nvidia-driver` meta-package) were upgraded from 590.48.01 to 595.71.05, but the running kernel never reloaded the new kernel module (no reboot occurred). The currently *loaded* kernel module is still 590.48.01 (`cat /proc/driver/nvidia/version`), while all userspace NVIDIA tooling (`nvidia-smi`, `nv-fabricmanager`) is now 595.71.05. `nvidia-fabricmanager-590` is a transitional dummy package with no real binary (depends on `-595`) — there is no way to run a 590 fabric manager anymore. `nvidia-fabricmanager.service` has been crash-looping/dead since that moment:
 
 ```
-Aug 11 06:47:54 sprocket nv-fabricmanager[186868]: fabric manager NVIDIA GPU driver interface version 595.71.05 don't match with driver version 590.48.01. Please update with matching NVIDIA driver package.
-Aug 11 06:47:54 sprocket nvidia-fabricmanager-start.sh[186855]: "/usr/bin/nv-fabricmanager -c /usr/share/nvidia/nvswitch/fabricmanager.cfg" failed! Exit code: 1
-Aug 11 06:47:54 sprocket systemd[1]: nvidia-fabricmanager.service: Failed with result 'exit-code'.
+Aug 11 06:47:54 gpu-host nv-fabricmanager[186868]: fabric manager NVIDIA GPU driver interface version 595.71.05 don't match with driver version 590.48.01. Please update with matching NVIDIA driver package.
+Aug 11 06:47:54 gpu-host nvidia-fabricmanager-start.sh[186855]: "/usr/bin/nv-fabricmanager -c /usr/share/nvidia/nvswitch/fabricmanager.cfg" failed! Exit code: 1
+Aug 11 06:47:54 gpu-host systemd[1]: nvidia-fabricmanager.service: Failed with result 'exit-code'.
 ```
 
 Because the fabric manager socket (`/run/nvidia-fabricmanager/socket`) is never created, Docker's NVIDIA container runtime — which unconditionally bind-mounts that socket into any container requesting GPU access on this NVSwitch system — fails at container-create time for **any** new GPU container:
@@ -422,7 +422,7 @@ and all three had to be refreshed:
    `gpus: all` (which resolves through CDI under `mode="auto"`). See commit 852de86.
 
 **Outstanding host debt:** `/run/cdi/nvidia.yaml` still contains 91 references to 590.48.01.
-Any *other* CDI-based GPU container on sprocket will still fail. It regenerates correctly on
+Any *other* CDI-based GPU container on gpu-host will still fail. It regenerates correctly on
 the next reboot (/run is tmpfs). The `runtime: nvidia` pin in docker-compose.yml is a
 workaround and should be reverted to `gpus: all` once the host is repaired.
 

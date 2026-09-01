@@ -276,6 +276,17 @@ the expected speculative-decoding profile.
   (root cause is presumably the container missing an init/reaper process);
   cosmetic in that teardown still succeeds once you clear the zombie.
 
+  **Fixed 2026-08-31 by `init: true`** on `x-worker-base` (docker-init as pid 1
+  reaps, so the container is no longer unkillable; stop and `compose up -d`
+  recreate now complete unaided). **The exit code is still 137** and that part
+  is NOT fixed: measured on a loaded worker 2026-09-01, SIGTERM at 01:41:51,
+  engine shutdown complete at 01:41:57, container SIGKILLed at 01:42:35.
+  Root cause is upstream, not reaping -- the shutdown handler calls
+  `kill_process_tree(..., include_parent=False)` and never terminates the engine
+  process itself, so pid 1 waits on a child that never exits. Treat 137 as
+  expected: the graceful path (unregister, engine shutdown, KV flush) has
+  already completed by +6s.
+
 ### Build gotchas (offline / behind-a-proxy environments)
 
 - **Behind a proxy:** the Docker bridge can't reach PyPI; the build needs

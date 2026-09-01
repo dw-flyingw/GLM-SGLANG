@@ -32,12 +32,27 @@ x-worker-base: &worker-base
   gpus: all
   ipc: host
   # The image runs the worker directly as pid 1, with no init to reap children.
-  # On SIGTERM the engine cleans up but pid 1 lingers as a zombie, so docker
-  # SIGKILLs it at the stop timeout (exit 137) -- which makes `./stop.sh` report
-  # "PID ... is zombie and can not be killed" and makes `docker restart` fail
-  # outright, leaving the worker DOWN rather than restarted (verified
-  # 2026-08-31). docker-init as pid 1 forwards signals and reaps. See the
-  # "Known issues" section of README.md.
+  # Without this, the container became UNKILLABLE on teardown: `./stop.sh`
+  # reported "PID ... is zombie and can not be killed", `docker restart` failed
+  # outright leaving the worker DOWN, and `docker compose up -d worker` refused
+  # to recreate it -- all needing a manual `docker kill` first. docker-init as
+  # pid 1 forwards signals and reaps, and that symptom is gone: stop and
+  # recreate now complete unaided (verified 2026-08-31/09-01).
+  #
+  # It does NOT stop the exit-137 teardown, and cannot. Measured on a fully
+  # loaded worker 2026-09-01: SIGTERM 01:41:51 -> engine shutdown complete
+  # 01:41:57 -> container SIGKILLed 01:42:35. ExitCode 137, `docker stop` rc=1
+  # after 24s. The cause is upstream and unrelated to reaping: the shutdown
+  # handler calls kill_process_tree(parent_pid=<engine>, include_parent=False),
+  # which kills the engine's children but never terminates the engine process
+  # itself, so pid 1 waits on a child that never exits and docker SIGKILLs at
+  # the stop timeout. The long tail after SIGKILL is most likely the kernel
+  # reclaiming ~920 GB of pinned host pools (96 GB + 19.32 GB per rank x 8) --
+  # plausible but NOT measured, so treat it as a hypothesis.
+  #
+  # 137 here is cosmetic: the graceful path already finished at +6s (endpoints
+  # unregistered, engine shut down, KV files flushed). Everything after is
+  # process teardown. Do not chase it without an upstream fix.
   init: true
   ulimits:
     memlock: -1

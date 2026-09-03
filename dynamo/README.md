@@ -348,7 +348,7 @@ the expected speculative-decoding profile.
     container's own cgroup.)
   - *The KV reaper deleting cache files under a live worker* — plausible on
     paper, but `/scratch/kvcache/reaper.log` shows `removed 0 files` on **every**
-    run: the tree is ~139 GB against a 10 TB budget, so it has never evicted
+    run: the tree is ~1.8 TB against a 10 TB budget, so it has never evicted
     anything.
   - *A recurring pattern* — the frontend's continuous log covers 2 days and
     contains exactly one unexplained worker death (the two on 09-01 were the

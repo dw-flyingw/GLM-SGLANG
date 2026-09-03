@@ -354,14 +354,53 @@ the expected speculative-decoding profile.
     contains exactly one unexplained worker death (the two on 09-01 were the
     deliberate Profile B experiments). This fired once.
 
-  **The one open thread**, recorded so it isn't lost: every worker start logs
+  **Leading hypothesis: the hierarchical-cache collectives.** Established
+  2026-09-03 by reading the engine source and sampling the live scheduler
+  (which the py-spy fix below made possible). Profile A runs
+  `--enable-hierarchical-cache` with `--hicache-storage-backend=file` on
+  `/scratch`, and that path performs **unconditional CPU all-reduces on every
+  prefill batch**, from `check_hicache_events` ←
+  `scheduler.py:2577 _get_new_batch_prefill_raw`:
+
+  | Collective | Reduces | Source |
+  |---|---|---|
+  | `loading_check` | `finish_count` of completed async KV loads, `ReduceOp.MIN` | `hiradix_cache.py:950` |
+  | `drain_storage_control_queues` | `[prefetch_revoke, ack_backup, host_mem_release]` queue depths, `ReduceOp.MIN` | `hiradix_cache.py:1307` |
+
+  Both go through `_all_reduce_attn_groups` (`hiradix_cache.py:196`) over the
+  TP group, and neither has a timeout. The `MIN` semantics are deliberate — the
+  docstring says it exists "to minimize TP synchronization" — and they keep all
+  8 ranks in lockstep on work whose pace is set by **disk I/O to `/scratch`**.
+
+  Why this fits: if one rank blocks in the file backend (a stalled NVMe read, a
+  slow fsync, an FS hiccup) it never *arrives* at the next collective, and the
+  other seven block in `all_reduce` forever. That produces precisely the
+  observed signature — every rank stops making forward progress at the same
+  instant, so all 8 trip the 300 s watchdog within 70 ms of each other, with
+  zero forward passes in between — and it is reachable **only in Profile A**,
+  which is what was running.
+
+  **Read the caveat before chasing it.** Sampling the live, *healthy* worker
+  shows all ranks sitting in exactly these frames, because an idle scheduler
+  polls `check_hicache_events` in a loop. Ranks being here is the NORMAL state
+  and is **not** evidence of a fault. This is a mechanism that fits the
+  evidence, not a diagnosis; nothing from the actual incident survived.
+
+  **The discriminating observation**, for whoever reads the next watchdog dump:
+  check whether *one* rank is somewhere else — inside the hicache file backend
+  — while the other seven sit in `_all_reduce_attn_groups`. That asymmetry
+  would confirm it. All 8 in the all-reduce with none in the backend would
+  point elsewhere. Cheap falsification if it recurs: run with
+  `--hicache-storage-backend` disabled (costs the L3 tier) and see whether the
+  hang follows.
+
+  **Also open, lower priority:** every worker start logs
   `NV_ERR_FABRIC_STATE_OUT_OF_SYNC` at `mem_multicast_fabric.c` in the kernel
   log, paired with `CUDASymmetricMemory.cu` warning `init_multicast_for_block`
-  failed. NVLink *multicast* allocation is therefore failing and torch is
-  falling back. This is **not** on its own an explanation — it happens on
-  successful starts too, including the currently-serving one — but the hang was
-  in a collective, so it is the first thing to correlate against the next
-  watchdog dump rather than something to dismiss.
+  failed. NVLink *multicast* allocation is failing and torch is falling back.
+  This is **not** an explanation — it happens on successful starts too,
+  including the currently-serving one — but the hang was in a collective, so
+  correlate it against the next dump rather than dismissing it.
 
 - **Crash diagnostics (added 2026-09-03).** The watchdog kill above produced no
   usable evidence — every py-spy dump returned `Permission Denied` and the CUDA

@@ -69,6 +69,36 @@ EOF
   export KV_SCRATCH_ROOT KV_SCRATCH_DIR
 fi
 
+# Crash-dump directory (both profiles). This is a WARNING, not a hard failure:
+# a broken diagnostics path must never stop the model from serving.
+#
+# It is still worth warning loudly, because the failure is silent in exactly
+# the way that matters. Docker auto-creates a missing bind-mount source as
+# root-owned, the container runs as uid=1000, so the mount SUCCEEDS and the
+# dump write fails later -- at the only moment you needed it to work.
+DIAG_DIR="$(realpath -m "${DIAG_DIR:-/scratch/diag}")"
+if [ ! -d "${DIAG_DIR}/coredumps" ]; then
+  cat >&2 <<EOF
+WARNING: crash-dump directory ${DIAG_DIR}/coredumps is missing.
+
+The worker will serve normally, but CUDA coredumps will have nowhere to land,
+and the archived worker logs that carry SGLang's py-spy watchdog dump cannot
+be written either -- the same blind spot that made the 2026-09-03 exit-137
+hang un-diagnosable.
+
+  sudo mkdir -p ${DIAG_DIR}/coredumps ${DIAG_DIR}/logs
+  sudo chown -R 1000:\$(id -g) ${DIAG_DIR}
+  sudo chmod -R 2775 ${DIAG_DIR}
+
+(Ownership matches KV_SCRATCH_ROOT's, and for the same reasons: owner 1000 so
+the container can write the coredumps, group kept as your host group with g+w
+so you can read and delete them AND so serve.sh/stop.sh -- which run as you,
+not as the container -- can write the log archives, setgid so new files
+inherit that group.)
+EOF
+fi
+export DIAG_DIR
+
 # Build the custom SGLang-0.5.13.post1 image if it's not present. --network=host is
 # required: Docker's default bridge network can't reach pypi.org behind a proxy.
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
@@ -78,6 +108,41 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
     --build-arg HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-}}" \
     --build-arg NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1}}" \
     -t "${IMAGE}" -f Dockerfile .
+fi
+
+# The build above fires only when the image is ABSENT, which is not enough for
+# the py-spy file capability the crash handler depends on. An image built
+# before that Dockerfile stanza existed is present, passes every other check,
+# and then silently returns "Permission Denied" on each watchdog dump -- which
+# is the 2026-09-03 failure reproduced exactly. Worse, the cap is easy to
+# "have" transiently: applying the xattr to a RUNNING container works and
+# survives until the next `docker compose up`, at which point the fix vanishes
+# with the container. So probe the IMAGE, never a live container.
+#
+# A warning, not a hard failure, for the usual reason: a broken diagnostics
+# path must never stop the model from serving. But the model DOES serve
+# blind until this is rebuilt.
+if ! docker run --rm "${IMAGE}" \
+     python3 -c "import os; os.getxattr('/usr/local/bin/py-spy', b'security.capability')" \
+     >/dev/null 2>&1; then
+  cat >&2 <<EOF
+WARNING: ${IMAGE} has no cap_sys_ptrace on /usr/local/bin/py-spy.
+
+The worker will serve normally, but if the scheduler hangs, SGLang's watchdog
+will fail every py-spy dump with "Permission Denied" and the stall will be as
+un-diagnosable as it was on 2026-09-03. \`cap_add: SYS_PTRACE\` alone does NOT
+cover this: it only puts CAP_SYS_PTRACE in the container's BOUNDING set, and
+the worker runs as uid 1000, so CapPrm/CapEff stay 0 and the cap grants
+nothing until the binary itself carries it.
+
+Rebuild the image (needs host networking + proxy for pip):
+
+  docker build --network=host -t ${IMAGE} -f $(pwd)/Dockerfile $(pwd)
+
+Then recreate the worker so it picks the new image up:
+
+  ./stop.sh && ./serve.sh
+EOF
 fi
 
 # Profile A writes its L3 KV tier to /scratch, from INSIDE THE CONTAINER, which
@@ -118,14 +183,26 @@ EOF
   fi
 fi
 
-echo "Starting Dynamo (SGLang) stack for GLM-5.2-FP8 [profile: ${PROFILE}] ..."
-docker compose --profile "${PROFILE}" up -d
-
 if [ "${PROFILE}" = "longctx" ]; then
   WORKER_SERVICE="worker-longctx"
 else
   WORKER_SERVICE="worker"
 fi
+
+# LAST CHANCE TO SAVE THE PREVIOUS WORKER'S LOG. `up -d` recreates the worker
+# whenever its config changed, and docker deletes a container's log along with
+# the container. That log is the ONLY place SGLang's watchdog writes its
+# per-rank py-spy dump, so recreating over a worker that died in the night
+# destroys the sole evidence of why -- which is precisely how the 2026-09-03
+# exit-137 hang ended up un-diagnosable. See archive_worker_log.sh.
+PREV_WORKER="$(docker compose --profile "${PROFILE}" ps -aq "${WORKER_SERVICE}" \
+                 2>/dev/null | head -n1 || true)"
+if [ -n "${PREV_WORKER}" ]; then
+  ./archive_worker_log.sh "${PREV_WORKER}" "${DIAG_DIR}/logs" || true
+fi
+
+echo "Starting Dynamo (SGLang) stack for GLM-5.2-FP8 [profile: ${PROFILE}] ..."
+docker compose --profile "${PROFILE}" up -d
 
 cat <<EOF
 

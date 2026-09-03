@@ -9,8 +9,28 @@ cd "$(dirname "$0")"
 # all 8 GPUs. Falls back to enumerating known profiles if the wildcard is ever
 # unsupported by the installed Compose version.
 if docker compose --profile "*" config --services >/dev/null 2>&1; then
-  docker compose --profile "*" down "$@"
+  PROFILE_ARGS=(--profile "*")
 else
-  docker compose --profile cache --profile longctx down "$@"
+  PROFILE_ARGS=(--profile cache --profile longctx)
 fi
+
+# LAST CHANCE TO SAVE THE WORKER'S LOG -- and the likelier of the two, since
+# `down` removes the containers unconditionally, where serve.sh only recreates
+# on a config change. Docker deletes a container's log along with the
+# container, and that log is the ONLY place SGLang's watchdog writes its
+# per-rank py-spy dump. Tearing down a worker that died in a hang therefore
+# destroys the sole evidence of why, which is exactly how the 2026-09-03
+# exit-137 hang ended up un-diagnosable. See archive_worker_log.sh.
+#
+# Both worker services are tried because stop.sh tears down every profile; only
+# one of them normally exists. DIAG_DIR matches serve.sh's default.
+DIAG_DIR="$(realpath -m "${DIAG_DIR:-/scratch/diag}")"
+for svc in worker worker-longctx; do
+  cid="$(docker compose "${PROFILE_ARGS[@]}" ps -aq "${svc}" 2>/dev/null | head -n1 || true)"
+  if [ -n "${cid}" ]; then
+    ./archive_worker_log.sh "${cid}" "${DIAG_DIR}/logs" || true
+  fi
+done
+
+docker compose "${PROFILE_ARGS[@]}" down "$@"
 echo "Dynamo stack stopped."

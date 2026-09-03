@@ -35,3 +35,40 @@ assert sg.startswith('0.5.13'), sg; assert sk >= '0.4.3', sk; \
 print('sglang', sg, '| sglang-kernel', sk)"
 # Note: importing sgl_kernel loads GPU-only CUDA ops (common_ops), so we check
 # versions via package metadata here; the ops are verified at container run time.
+
+# --- Crash diagnostics: let py-spy dump a hung rank -------------------------
+# SGLang's watchdog handler shells out to py-spy to dump every rank's Python
+# stack when the scheduler stalls. On 2026-09-03 all 8 ranks hit the 300 s
+# watchdog and EVERY dump failed with "Permission Denied", so the hang was
+# un-diagnosable. Two separate things block it, and both must be fixed:
+#
+#   1. The host runs Yama ptrace_scope=1, so a process may only ptrace its own
+#      DESCENDANTS. The handler dumps sibling ranks, which is not that.
+#      CAP_SYS_PTRACE bypasses Yama.
+#   2. The container runs as uid 1000, and Docker sets no ambient capabilities.
+#      `cap_add: SYS_PTRACE` in docker-compose.yml therefore only puts the cap
+#      in the BOUNDING set (CapBnd) -- CapPrm/CapEff stay 0 and it grants
+#      nothing on its own. It is necessary but not sufficient.
+#
+# A file capability on the binary closes the gap: on exec the kernel computes
+# permitted = file_permitted & bounding, so py-spy (and only py-spy) picks the
+# cap up as uid 1000 -- which is why the compose-side cap_add must stay.
+# Verified: same binary, uid 1000, non-descendant target -> "Permission Denied"
+# without this, full stack dump with it.
+#
+# setcap(8) is not in the image (no libcap2-bin) and apt would need the build
+# proxy, so write the xattr directly -- it is a fixed 20-byte struct.
+USER root
+RUN python3 -c "import struct, os; \
+CAP_SYS_PTRACE = 19; \
+VFS_CAP_REVISION_2 = 0x02000000; \
+VFS_CAP_FLAGS_EFFECTIVE = 0x000001; \
+blob = struct.pack('<IIIII', VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE, 1 << CAP_SYS_PTRACE, 0, 0, 0); \
+os.setxattr('/usr/local/bin/py-spy', b'security.capability', blob)" \
+    && python3 -c "import os; \
+v = os.getxattr('/usr/local/bin/py-spy', b'security.capability'); \
+assert v == bytes.fromhex('0100000200000800000000000000000000000000'), v.hex(); \
+print('py-spy cap_sys_ptrace+ep set')"
+# Restore the base image's runtime user (uid 1000). Everything above this line
+# is the only root window in the build.
+USER dynamo

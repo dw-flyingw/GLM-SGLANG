@@ -1251,3 +1251,252 @@ $ docker compose --profile cache logs --tail=500 worker 2>&1 | grep -c "Allocati
 ```
 
 All 8 TP-rank host-memory allocations present, confirming Profile A came back up correctly. No source files were modified during this task.
+
+## Profile B attempt 4 — 768K context (2026-09-01)
+
+**This section supersedes the concluding speculation in the two Profile B
+sections above** (the passages recommending "a smaller `--context-length` for
+Profile B rather than further mem-fraction/graph-count tuning, since the
+indexer's own working set scales with the addressable context"). That
+recommendation was tested here and is **wrong**. The earlier passages are left
+in place as the record of what was concluded at the time; this section is the
+correction.
+
+### Hypothesis
+
+The HiSparse indexer's CUDA-graph capture working set scales with
+`--context-length` (its addressable range) rather than with concurrency, so
+reducing the target from 1,048,576 to 786,432 should shrink that allocation
+enough to close the ~1.0 GiB gap attempt 3 missed by.
+
+### Method — one variable
+
+Attempt 3's exact configuration (`--mem-fraction-static=0.88`,
+`--cuda-graph-max-bs=128`) with **only** `--context-length` changed.
+
+```bash
+cd /home/users/wrightda/src/GLM-5.2-FP8/dynamo
+./stop.sh
+MAX_MODEL_LEN_LONG=786432 PROFILE=longctx ./serve.sh
+```
+
+Applied engine args confirmed from the worker log before capture began:
+
+```
+context_length=786432
+cuda_graph_max_bs=128
+disable_radix_cache=True
+enable_hisparse=True
+mem_fraction_static=0.88
+```
+
+### Result — OOM, earlier in the sequence than attempt 3
+
+Weights loaded normally (93.2 GB/GPU, local HF snapshot, no download). The
+worker then died in the **generic** CUDA-graph capture — the stage attempt 3
+had already cleared — not in the HiSparse indexer capture:
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 60.00 MiB.
+GPU 1 has a total capacity of 139.80 GiB of which 48.06 MiB is free.
+Including non-PyTorch memory, this process has 139.63 GiB memory in use.
+Of the allocated memory 135.16 GiB is allocated by PyTorch, with 1.18 GiB
+allocated in private pools (e.g., CUDA Graphs), and 285.67 MiB is reserved
+by PyTorch but unallocated.
+```
+
+Call path (abridged; `sglang/srt/` paths):
+
+```
+scheduler.py:427   Scheduler.__init__ -> init_model_worker
+model_runner.py:834  ModelRunner.initialize -> init_device_graphs
+cuda_graph_runner.py:628  raise Exception("Capture cuda graph failed: ...")
+```
+
+### Comparison
+
+| Attempt | `--context-length` | Died in | Free at failure |
+|---|---|---|---|
+| 3 (2026-08-31) | 1,048,576 | `dsa_indexer.py::_get_topk_paged` (HiSparse indexer capture) | 488 MiB (GPU 6) |
+| 4 (2026-09-01) | 786,432 | `cuda_graph_runner.py:628` (generic capture) | 48.06 MiB (GPU 1) |
+
+Cutting the target context by 25% made the worker fail **sooner** in the
+startup sequence with **less** memory free.
+
+### Why: `--context-length` does not size the KV pool
+
+`--mem-fraction-static` fixes the static budget (weights + KV pool), and
+SGLang sizes the KV pool to fill whatever remains of that budget once the
+weights are loaded. The pool is **not** derived from `--context-length`,
+which only caps how long a single request may be. Lowering the target from 1M
+to 768K therefore freed no GPU memory at all; it only changed which rank lost
+the allocation race first. At `0.88` the static budget is
+0.88 x 139.80 = 123.0 GiB/GPU and the process still ended with 139.63 GiB in
+use.
+
+Consequence: `--context-length` is not a lever for the Profile B OOM, and the
+only knob that actually resizes the pool is `--mem-fraction-static`. Attempt 2
+already showed that conversion is not 1:1 (freeing ~2.8 GiB of static budget
+bought ~0.75 GiB of extra free memory at failure), so values well below the
+0.86 already tried are the remaining test.
+
+### Bench
+
+None. The instruction was to benchmark at 768K only if the worker started; it
+did not reach a registered state, so no throughput or latency numbers exist
+for Profile B and none are claimed.
+
+### Profile A restored
+
+Profile B was torn down and `PROFILE=cache ./serve.sh` re-run immediately
+after the failure.
+
+## Profile B attempts 5 and 6 — mem-fraction 0.82 at 1M (2026-09-01)
+
+Attempt 4 established that `--context-length` does not size the KV pool, leaving
+`--mem-fraction-static` as the only knob that does. Attempts 1 and 2 had tried
+0.88 and 0.86; these two attempts test a materially larger step down.
+
+### Attempt 5 — 0.82, full 1M, MTP still enabled
+
+One variable vs attempt 3: `--mem-fraction-static` 0.88 → 0.82.
+
+```bash
+cd /home/users/wrightda/src/GLM-5.2-FP8/dynamo
+./stop.sh
+MEM_FRACTION_LONG=0.82 PROFILE=longctx ./serve.sh
+```
+
+Applied args: `context_length=1048576`, `mem_fraction_static=0.82`,
+`cuda_graph_max_bs=128`, `enable_hisparse=True`, `disable_radix_cache=True`.
+
+**The CUDA-graph OOM that blocked attempts 1–4 is gone.** Capture was entered
+with 9.16–9.63 GB free per rank, against 488 MiB at attempts 1 and 3:
+
+```
+model_runner.init_piecewise_cuda_graphs: Capture piecewise CUDA graph begin.
+  avail mem=9.63 GB
+  avail mem=9.16 GB
+```
+
+The worker then failed in the MTP draft model, on all 8 ranks:
+
+```
+AttributeError: 'HiSparseDSATokenToKVPool' object has no attribute
+                'full_to_hisparse_device_index_mapping'
+  deepseek_nextn.py:350  forward
+  deepseek_nextn.py:227  forward -> self.decoder(...)
+  deepseek_v2.py:2102    forward -> self.self_attn(...)
+  deepseek_v2.py:1868    forward_core -> forward_absorb_core
+```
+
+Cause, from the installed source: the attribute is set by
+`HiSparseDSATokenToKVPool.register_mapping()`
+(`sglang/srt/mem_cache/hisparse_memory_pool.py:72`), and
+`sglang/srt/managers/hisparse_coordinator.py` calls it only for the main pool.
+The NextN/MTP draft model receives its own pool instance on which
+`register_mapping()` is never called. **HiSparse and speculative decoding are
+unwired in SGLang 0.5.13.post1.**
+
+Action taken: the four speculative flags were removed from `worker-longctx` in
+`docker-compose.yml` (Profile A keeps its MTP untouched). This is the remedy the
+profile's own comment had anticipated. Cost: Profile B forgoes the ~2×
+single-stream decode MTP provides.
+
+### Attempt 6 — 0.82, full 1M, no MTP
+
+```bash
+MEM_FRACTION_LONG=0.82 PROFILE=longctx ./serve.sh
+```
+
+**The worker started and registered at the full 1M — the first time in six
+attempts.** CUDA-graph capture completed in 132.32 s using 1.32 GB, leaving
+~10.5 GB free:
+
+```
+scheduler.init_model_worker: max_total_num_tokens=460352, chunked_prefill_size=8192,
+  max_prefill_tokens=16384, max_running_requests=128, context_len=1048576,
+  available_gpu_mem=10.52 GB
+memory_pool_host.__init__: Allocating 47.11 GB host memory for hierarchical KV cache.  (x8 ranks)
+model_runner.init_piecewise_cuda_graphs: Capture piecewise CUDA graph end.
+  Time elapsed: 132.32 s. mem usage=1.32 GB. avail mem=10.52 GB.
+```
+
+```
+$ curl -s http://localhost:8000/v1/models
+{"object":"list","data":[{"id":"glm-5.2-fp8","object":"model","created":1788229578,
+ "owned_by":"nvidia","context_window":1048576}]}
+```
+
+Note the KV pool: **460,352 tokens, *smaller* than Profile A's 540,928.** A 1M
+request is therefore only servable if HiSparse's host paging works; the pool
+itself never grew. That is what the benchmark was meant to prove.
+
+### Attempt 6 crashed on its first request
+
+```bash
+./bench_stream.py --concurrency 1 --num 16 --max-tokens 256 --tag profB-latency
+```
+
+```
+req error: HTTP Error 503: Service Unavailable   (x15)
+
+=== bench profB-latency pass 1/1  conc=1 num=16 max_tokens=256 ===
+requests ok/err     : 1/15
+wall time           : 66.36 s
+TTFT  mean/p50/p99  : 846 / 846 / 846 ms
+output tokens total : 1
+system output tok/s : 0.0
+```
+
+One request produced a single token, then the worker died (exit 137) and the
+remaining 15 got HTTP 503. On all 8 ranks:
+
+```
+TypeError: 'NoneType' object is not subscriptable
+  scheduler.py:1471          event_loop_overlap
+  scheduler.py:2522          get_next_batch_to_run
+  scheduler.py:2923          update_running_batch
+  schedule_batch.py:2568     prepare_for_decode
+  hisparse_coordinator.py:459  map_last_loc_to_buffer
+  hisparse_coordinator.py:535  req_idx = int(req_pool_indices_cpu[i])
+```
+
+`req_pool_indices_cpu` is declared `= None` at `schedule_batch.py:1609` and
+assigned only on the extend/alloc path (`self.req_pool_indices_cpu =
+req_pool_indices_cpu`, line 2094, fed by `alloc_for_extend` at line 1932). The
+**decode** path never populates it, so `prepare_for_decode` passes `None` into
+HiSparse's `_eager_backup_previous_token`. This is an SGLang bug on the ordinary
+decode path — not hardware, not memory, not configuration, and not related to
+the MTP failure in attempt 5.
+
+**Consequence: Profile B cannot serve a request at any context length on SGLang
+0.5.13.post1.** The memory ceiling that dominated attempts 1–4 turned out to be
+only the first of three blockers. No throughput or latency numbers exist for
+Profile B; the single 846 ms TTFT above is a crash artifact and is not a
+measurement.
+
+### Bench not run
+
+The full-length (768K/1M) benchmark could not be run: the worker never survived
+a request. Nothing is claimed about Profile B's prefill or decode performance.
+
+### Profile A restored and verified
+
+```
+scheduler.init_model_worker: max_total_num_tokens=540928, ... context_len=524288,
+  available_gpu_mem=10.09 GB
+
+$ curl -s http://localhost:8000/v1/models
+{"id":"glm-5.2-fp8", ... "context_window":524288}
+
+$ curl -s .../v1/chat/completions -d '{... "messages":[{"role":"user","content":"Say OK"}], "max_tokens":512}'
+content: 'OK.'   finish: stop   usage: {'prompt_tokens': 14, 'completion_tokens': 61, 'total_tokens': 75}
+```
+
+### Config changes made during this task
+
+- `worker-longctx`: the four `--speculative-*` flags removed (attempt 5).
+- `worker-longctx`: `MEM_FRACTION_LONG` default 0.88 → **0.82**, the only value
+  measured to start.
+- Profile A (`worker`) unchanged, still `--mem-fraction-static=0.85`.

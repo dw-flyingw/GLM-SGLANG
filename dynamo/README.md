@@ -39,6 +39,8 @@ clean path to multi-node disaggregation later.
 - `docker-compose.yml` — etcd + NATS + Dynamo frontend + one SGLang worker (TP=8). Host
   networking; tunables via `${...}` env (see below).
 - `serve.sh` / `stop.sh` — bring the stack up / down.
+- `archive_worker_log.sh` — copy a worker's docker log somewhere durable before
+  the container is removed. Called automatically by both of the above.
 - `bench.sh` — load-test any OpenAI endpoint (Dynamo or vLLM) with aiperf/genai-perf.
 
 ## Usage
@@ -159,20 +161,21 @@ closes.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `PROFILE` | `cache` | `cache` = Profile A (tiered KV cache, 512K); `longctx` = Profile B (HiSparse, 1M target — does not currently start, see below) |
+| `PROFILE` | `cache` | `cache` = Profile A (tiered KV cache, 512K); `longctx` = Profile B (HiSparse, 1M target — starts but crashes on the first request, see below) |
 | `HICACHE_GB` | `96` | L2 host RAM pool size, **per TP rank** (see tier table above for why this multiplies by 8) |
 | `HICACHE_WRITE_POLICY` | `write_through` | `write_through` (every page, default) vs `write_through_selective` (hotter pages only — measured not to help, see above) |
 | `KV_SCRATCH_ROOT` | `/scratch/kvcache` | host directory bind-mounted into the container (the whole tree) |
 | `KV_SCRATCH_DIR` | `/scratch/kvcache/glm52` | this model's subdirectory under `KV_SCRATCH_ROOT`; must stay under it or it isn't visible in the container |
 | `HISPARSE_DEVICE_BUFFER` | `4096` | Profile B only — HiSparse device-side buffer size |
 | `HISPARSE_RATIO` | `2` | Profile B only — HiSparse host-to-device ratio |
-| `MAX_MODEL_LEN_LONG` | `1048576` | Profile B only — target context length (the full 1M) |
-| `MEM_FRACTION_LONG` | `0.88` | Profile B only — tried at `0.88` and `0.86`, both OOM (see below) |
+| `MAX_MODEL_LEN_LONG` | `1048576` | Profile B only — target context length (the full 1M); lowering it does **not** free GPU memory (attempt 4, see below) |
+| `MEM_FRACTION_LONG` | `0.82` | Profile B only — the only value measured to start; `0.88`/`0.86` both OOM in CUDA-graph capture (see below). The only knob that actually resizes the KV pool |
 | `CUDA_GRAPH_MAX_BS_LONG` | `128` | Profile B only — caps CUDA-graph capture at the concurrency ceiling instead of SGLang's default 512; reduced but did not close the OOM (see below) |
 
-**Profile B (HiSparse, 1M context) — does not start on this hardware.** Three
-attempts, all CUDA OOM during CUDA-graph capture, none reaching a registered
-state:
+**Profile B (HiSparse, 1M context) — starts at 1M, but cannot serve a
+request.** Six attempts. Attempts 1–4 were CUDA OOM during CUDA-graph capture;
+`mem-fraction 0.82` cleared that outright, and what remains are two SGLang
+defects:
 
 1. `--mem-fraction-static=0.88` (default): OOM in generic graph capture,
    488.19 MiB free at failure (GPU 6).
@@ -184,13 +187,38 @@ state:
    OOM'd one call deeper, inside the **HiSparse indexer's own graph capture**
    (`dsa_indexer.py::_get_topk_paged`), needing 1.50 GiB with only 488 MiB
    free and the GPU fully pinned (139.20/139.80 GiB in use).
+4. `MAX_MODEL_LEN_LONG=786432` (2026-09-01) — attempt 3's config with **only**
+   the context length changed, 768K instead of 1M: failed *earlier* in the
+   sequence, back in generic graph capture (`cuda_graph_runner.py:628`), with
+   *less* memory free (48.06 MiB, GPU 1) — `Tried to allocate 60.00 MiB`,
+   135.16 GiB allocated by PyTorch, 1.18 GiB in CUDA-graph private pools.
 
-Diagnosis: the indexer's capture working set scales with HiSparse's
-1,048,576-token addressable range, not with request concurrency, so
-graph-count and mem-fraction tuning cannot close the gap — the untried lever
-is a smaller `--context-length` for this profile. Full logs and exact
-commands: `RESULTS-kv-tiering.md`, section "Profile B (hisparse, long
-context)".
+5. `MEM_FRACTION_LONG=0.82` at the full 1M (2026-09-01): **OOM gone** —
+   capture entered with 9.16–9.63 GB free instead of 488 MiB and cleared.
+   Died in the MTP draft model on all 8 ranks: `AttributeError:
+   'HiSparseDSATokenToKVPool' object has no attribute
+   'full_to_hisparse_device_index_mapping'`. HiSparse + speculative decoding
+   is unwired in SGLang 0.5.13.post1.
+6. Attempt 5 minus the four speculative flags (2026-09-01): **started and
+   registered at `context_window: 1048576`**, `max_total_num_tokens=460352`,
+   `available_gpu_mem=10.52 GB`, 47.11 GB host KV per rank. Then **crashed on
+   the first request** — `TypeError: 'NoneType' object is not subscriptable`
+   at `hisparse_coordinator.py:535`, because `req_pool_indices_cpu` is only
+   assigned on the extend path (`schedule_batch.py:2094`) and the decode path
+   passes `None`. One request returned a single token before the worker died;
+   the other 15 got HTTP 503.
+
+Diagnosis (revised 2026-09-01): the memory story is settled —
+`--mem-fraction-static` fixes the static budget (weights + KV pool) and
+SGLang sizes the KV pool to fill whatever remains of it after the weights
+load. The pool is **not** derived from `--context-length`, which only caps
+per-request length; attempt 4 proved lowering the target frees no GPU memory,
+and 0.82 proved mem-fraction is the knob that does. What blocks Profile B now
+is **not capacity** but two SGLang HiSparse bugs — one in the MTP integration,
+one on the plain decode path — neither fixable from this repo. Re-test on an
+engine newer than 0.5.13.post1. **No throughput or latency numbers exist for
+Profile B and none are claimed.** Full logs and exact commands:
+`RESULTS-kv-tiering.md`, section "Profile B (hisparse, long context)".
 
 ## Benchmark
 
@@ -286,6 +314,150 @@ the expected speculative-decoding profile.
   process itself, so pid 1 waits on a child that never exits. Treat 137 as
   expected: the graceful path (unregister, engine shutdown, KV flush) has
   already completed by +6s.
+
+- **Scheduler watchdog kill (also exit 137, but a real fault — not the cosmetic
+  teardown one above).** On 2026-09-03 the worker died after ~2.5 days up. The
+  signature is distinct from the teardown 137 and worth learning to tell apart:
+
+  | | Teardown 137 (cosmetic) | Watchdog 137 (real) |
+  |---|---|---|
+  | Trigger | you ran `./stop.sh` | nothing — it died on its own |
+  | Log marker | `SIGTERM` → engine shutdown | `Scheduler watchdog timeout` |
+  | Preceded by | a clean unregister | ~5 min of *zero* forward passes |
+
+  What happened: last forward pass at 15:01:37, then the scheduler stalled with
+  4 requests in flight. Requests kept arriving (15:05–15:09) with no prefill or
+  decode progress. At 15:09:02 — exactly `watchdog_timeout=300` s later — the
+  watchdog fired **on all 8 ranks within 70 ms of each other**, which points at
+  a hang in a collective rather than a single-rank fault. Then SIGQUIT →
+  `kill_process_tree` → SIGKILL.
+
+  Not an OOM: `docker inspect` reported `OOMKilled=false`, and the host had
+  2.2 TB with 48 GB used. Root cause **not** identified, because both crash
+  diagnostics were unavailable at the time (fixed below).
+
+  **Ruled out afterwards (2026-09-03, host-level evidence that outlived the
+  container).** None of these explain the stall, so don't re-tread them:
+
+  - *GPU hardware fault* — no `Xid` anywhere in `/var/log/kern.log`; 0
+    uncorrected volatile ECC errors on all 8 GPUs; every NVLink up at
+    26.562 GB/s; `nvidia-fabricmanager` active since 2026-09-02 06:50 with
+    `Fabric State: Completed / Status: Success` on all 8.
+  - *Host OOM killer* — the kernel log records no OOM kill of any process, at
+    any time. (Distinct from the `OOMKilled=false` check, which only covers the
+    container's own cgroup.)
+  - *The KV reaper deleting cache files under a live worker* — plausible on
+    paper, but `/scratch/kvcache/reaper.log` shows `removed 0 files` on **every**
+    run: the tree is ~139 GB against a 10 TB budget, so it has never evicted
+    anything.
+  - *A recurring pattern* — the frontend's continuous log covers 2 days and
+    contains exactly one unexplained worker death (the two on 09-01 were the
+    deliberate Profile B experiments). This fired once.
+
+  **Leading hypothesis: the hierarchical-cache collectives.** Established
+  2026-09-03 by reading the engine source and sampling the live scheduler
+  (which the py-spy fix below made possible). Profile A runs
+  `--enable-hierarchical-cache` with `--hicache-storage-backend=file` on
+  `/scratch`, and that path performs **unconditional CPU all-reduces on every
+  prefill batch**, from `check_hicache_events` ←
+  `scheduler.py:2577 _get_new_batch_prefill_raw`:
+
+  | Collective | Reduces | Source |
+  |---|---|---|
+  | `loading_check` | `finish_count` of completed async KV loads, `ReduceOp.MIN` | `hiradix_cache.py:950` |
+  | `drain_storage_control_queues` | `[prefetch_revoke, ack_backup, host_mem_release]` queue depths, `ReduceOp.MIN` | `hiradix_cache.py:1307` |
+
+  Both go through `_all_reduce_attn_groups` (`hiradix_cache.py:196`) over the
+  TP group, and neither has a timeout. The `MIN` semantics are deliberate — the
+  docstring says it exists "to minimize TP synchronization" — and they keep all
+  8 ranks in lockstep on work whose pace is set by **disk I/O to `/scratch`**.
+
+  Why this fits: if one rank blocks in the file backend (a stalled NVMe read, a
+  slow fsync, an FS hiccup) it never *arrives* at the next collective, and the
+  other seven block in `all_reduce` forever. That produces precisely the
+  observed signature — every rank stops making forward progress at the same
+  instant, so all 8 trip the 300 s watchdog within 70 ms of each other, with
+  zero forward passes in between — and it is reachable **only in Profile A**,
+  which is what was running.
+
+  **Read the caveat before chasing it.** Sampling the live, *healthy* worker
+  shows all ranks sitting in exactly these frames, because an idle scheduler
+  polls `check_hicache_events` in a loop. Ranks being here is the NORMAL state
+  and is **not** evidence of a fault. This is a mechanism that fits the
+  evidence, not a diagnosis; nothing from the actual incident survived.
+
+  **The discriminating observation**, for whoever reads the next watchdog dump:
+  check whether *one* rank is somewhere else — inside the hicache file backend
+  — while the other seven sit in `_all_reduce_attn_groups`. That asymmetry
+  would confirm it. All 8 in the all-reduce with none in the backend would
+  point elsewhere. Cheap falsification if it recurs: run with
+  `--hicache-storage-backend` disabled (costs the L3 tier) and see whether the
+  hang follows.
+
+  **Also open, lower priority:** every worker start logs
+  `NV_ERR_FABRIC_STATE_OUT_OF_SYNC` at `mem_multicast_fabric.c` in the kernel
+  log, paired with `CUDASymmetricMemory.cu` warning `init_multicast_for_block`
+  failed. NVLink *multicast* allocation is failing and torch is falling back.
+  This is **not** an explanation — it happens on successful starts too,
+  including the currently-serving one — but the hang was in a collective, so
+  correlate it against the next dump rather than dismissing it.
+
+- **Crash diagnostics (added 2026-09-03).** The watchdog kill above produced no
+  usable evidence — every py-spy dump returned `Permission Denied` and the CUDA
+  path bailed with `CUDA user-triggered coredump is not enabled`. Three changes
+  make the next one diagnosable:
+
+  1. `cap_add: SYS_PTRACE` on `x-worker-base`, **and** a `cap_sys_ptrace+ep`
+     file capability on `/usr/local/bin/py-spy` in the `Dockerfile`. Both are
+     required and neither works alone: the host runs Yama `ptrace_scope=1` (a
+     process may only ptrace its own *descendants*, and the handler dumps
+     *sibling* ranks), while the container runs as uid 1000 with no ambient
+     capabilities — so `cap_add` alone only reaches `CapBnd`, leaving
+     `CapPrm`/`CapEff` at `0`. The file capability is what actually delivers the
+     cap to py-spy at exec.
+  2. `CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1`, with `CUDA_COREDUMP_FILE` pointed
+     at `${DIAG_DIR:-/scratch/diag}/coredumps` — its own bind mount, deliberately
+     **outside** the KV tree (the reaper deletes the oldest regular file of *any*
+     name under its root, so a dump parked there would be both reaper-bait and a
+     cause of real KV eviction). `CUDA_COREDUMP_PIPE` is left at the driver
+     default on purpose: SGLang looks for the trigger pipe at the cwd-relative
+     path, and overriding it would move the pipe away from the code that fires it.
+  3. `CUDA_COREDUMP_GENERATION_FLAGS=skip_global_memory`, because dumping device
+     global memory writes ~122 GB *per rank* (~1 TB per incident across 8) and
+     answers nothing about where a rank is stuck. Backtraces plus local/shared
+     memory are kept.
+  4. **The log has to outlive the container.** 1–3 make the watchdog produce
+     evidence; this makes it survive long enough to read. The watchdog writes
+     its py-spy dump to the worker's stdout and nowhere else — there is no log
+     file inside the container — and docker deletes a container's log *along
+     with the container*. Both teardown paths here do exactly that: `stop.sh`
+     runs `compose down` (always removes), `serve.sh` runs `compose up -d`
+     (recreates on any config change). That is how the 2026-09-03 evidence was
+     actually lost: the worker died at 15:10 and the 18:05 restart destroyed
+     the only copy. Both scripts now call `archive_worker_log.sh` *before*
+     tearing down, writing `${DIAG_DIR:-/scratch/diag}/logs/<service>-<UTC
+     timestamp>-<short id>.log.gz` (~25 KB gzipped for a full startup;
+     `docker logs --timestamps`, so the host clock lines up with
+     `/var/log/kern.log` and the frontend log). A failure only warns — a broken
+     diagnostics path must never block serving or a teardown that frees 8 GPUs.
+     Archives are never pruned; they are tiny, and auto-deleting crash evidence
+     is the bug this fixes. Regression tests: `tests/test_archive_worker_log.py`.
+
+  To pull stacks from a wedged worker by hand, without waiting for the watchdog:
+
+  ```bash
+  docker exec dynamo-worker-1 bash -c \
+    'for p in $(pgrep -f sglang::scheduler); do echo "== $p"; py-spy dump --pid $p; done'
+  ```
+
+  If that prints `Permission Denied`, the running image predates the `Dockerfile`
+  change — rebuild it, or patch the live container (does not survive recreation):
+
+  ```bash
+  docker exec -u 0:0 dynamo-worker-1 python3 -c \
+    "import os; os.setxattr('/usr/local/bin/py-spy', b'security.capability', \
+     bytes.fromhex('0100000200000800000000000000000000000000'))"
+  ```
 
 ### Build gotchas (offline / behind-a-proxy environments)
 

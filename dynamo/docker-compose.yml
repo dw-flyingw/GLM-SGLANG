@@ -22,6 +22,45 @@ x-dynamo-env: &dynamo-env
   ETCD_ENDPOINTS: "http://localhost:2379"
   NATS_SERVER: "nats://localhost:4222"
 
+# Crash diagnostics for the SGLang worker. Merged into BOTH worker services
+# (workers only -- the frontend holds no CUDA context and needs none).
+#
+# Why this exists: on 2026-09-03 the scheduler stalled mid-batch, the 300 s
+# watchdog fired on all 8 ranks within 70 ms of each other (a collective hang,
+# not a single-rank fault), and SGLang's crash handler produced NOTHING usable
+# -- every py-spy dump hit "Permission Denied" (fixed by cap_add: SYS_PTRACE
+# above) and the CUDA path bailed with "CUDA user-triggered coredump is not
+# enabled. Set CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1 before CUDA
+# initialization." Root-caused nothing; the worker just died with exit 137.
+x-coredump-env: &coredump-env
+  CUDA_ENABLE_USER_TRIGGERED_COREDUMP: "1"
+  # Where the dump LANDS. Must be set, and must be outside the KV tree.
+  # Two independent hazards if it is left at the default (cwd = /workspace):
+  #   1. /workspace is the container's ephemeral overlay, i.e. the 438 GB ROOT
+  #      filesystem -- the same trap SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR
+  #      exists to avoid.
+  #   2. Anywhere under the reaper's root (/scratch/kvcache/glm52) is worse
+  #      still: kv_reaper.py deletes the OLDEST REGULAR FILE of any name until
+  #      the tree fits its byte budget -- it does not filter on .bin -- so a
+  #      multi-GB dump would both be reaper-bait itself and evict real KV
+  #      pages to pay for its own size.
+  # /scratch/diag is a separate bind mount for exactly this (see DIAG_DIR
+  # below), on the 28 TB NVMe, outside every reaped tree.
+  # %h = hostname, %p = pid, so the 8 ranks cannot overwrite each other.
+  CUDA_COREDUMP_FILE: "${DIAG_DIR:-/scratch/diag}/coredumps/core.cuda.%h.%p"
+  # Dumping device global memory would write ~122 GB PER RANK -- ~1 TB per
+  # incident for 8 ranks -- and none of it answers "which kernel is each rank
+  # stuck in". skip_global_memory drops that bulk and keeps the parts that do:
+  # backtraces, local and shared memory, ELF images. Flag names verified
+  # against this host's driver (libcuda.so.1, CUDA 13.0), not assumed.
+  CUDA_COREDUMP_GENERATION_FLAGS: "skip_global_memory"
+  # NOTE: CUDA_COREDUMP_PIPE is deliberately NOT set. SGLang looks for the
+  # user-trigger pipe at the driver's default -- cwd-relative
+  # "corepipe.cuda.%h.%p", i.e. /workspace/corepipe.cuda.<host>.<pid>, which is
+  # verbatim the path the 2026-09-03 logs reported missing. Overriding it would
+  # move the pipe out from under the code that triggers the dump. The pipe is a
+  # FIFO (no data at rest), so leaving it on the overlay costs nothing.
+
 # Shared base for SGLang worker services (Profile A "cache" below; Profile B
 # "longctx" is added alongside it on this branch). YAML merge (<<:) replaces
 # whole keys wholesale, so profiles/environment/volumes/command stay spelled
@@ -54,6 +93,15 @@ x-worker-base: &worker-base
   # unregistered, engine shut down, KV files flushed). Everything after is
   # process teardown. Do not chase it without an upstream fix.
   init: true
+  # py-spy needs ptrace to dump the Python stack of a hung rank. Without this,
+  # SGLang's crash handler runs but every dump fails with "Permission Denied:
+  # Try running again with elevated permissions" -- which is exactly what
+  # happened on the 2026-09-03 watchdog kill, leaving no evidence of WHERE the
+  # scheduler was stuck. py-spy targets processes in this container only.
+  # (Incremental risk is small here: the worker already has network_mode: host,
+  # gpus: all and ipc: host.)
+  cap_add:
+    - SYS_PTRACE
   ulimits:
     memlock: -1
     stack: 67108864
@@ -110,7 +158,7 @@ services:
     # together with --disable-radix-cache, which HiSparse requires.
     profiles: ["cache"]
     environment:
-      <<: *dynamo-env
+      <<: [*dynamo-env, *coredump-env]
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
       # HiCacheFile defaults to /tmp/hicache -- the 438 GB ROOT filesystem --
@@ -127,6 +175,10 @@ services:
       # L3 KV tier. Separate NVMe devices from /data (the weight cache), so
       # cache I/O does not contend with weight loading.
       - "${KV_SCRATCH_ROOT:-/scratch/kvcache}:${KV_SCRATCH_ROOT:-/scratch/kvcache}"
+      # Crash-dump target (see x-coredump-env). Its own mount, deliberately NOT
+      # a subdirectory of KV_SCRATCH_ROOT: the reaper walks that tree, and this
+      # profile is the only one that mounts it at all.
+      - "${DIAG_DIR:-/scratch/diag}:${DIAG_DIR:-/scratch/diag}"
     # SGLang engine args pass straight through. We let SGLang AUTO-SELECT the DSA
     # attention backend (no --attention-backend): on Hopper with fp8 KV it picks
     # flashmla_kv for prefill+decode. Parsers are the Dynamo-side (frontend) parsers.
@@ -200,17 +252,43 @@ services:
   # from host RAM. That is the design that would raise the servable context
   # past 512K -- IF it started.
   #
-  # IT DOES NOT START ON THIS HARDWARE. Measured 2026-08-31, three attempts
-  # (default mem-fraction 0.88, reduced mem-fraction 0.86, reduced
-  # cuda-graph-max-bs) all hit CUDA OOM during CUDA-graph capture; none
-  # reached a registered state. Full logs: RESULTS-kv-tiering.md, section
-  # "Profile B (hisparse, long context)"; summary: dynamo/README.md, section
-  # "Tiered KV cache". The untried lever is a smaller --context-length for
-  # this profile -- the indexer's own graph-capture working set scales with
-  # HiSparse's addressable range (currently the full 1,048,576-token target),
-  # not with concurrency, which is why graph-count and mem-fraction tuning
-  # alone cannot close the gap. See the `--mem-fraction-static` and
-  # `--cuda-graph-max-bs` comments below for the three attempts in detail.
+  # IT STARTS AT 1M BUT CANNOT SERVE A REQUEST. Six attempts.
+  #   1-3 (2026-08-31, mem-fraction 0.88 / 0.86 / 0.88+cuda-graph-max-bs) and
+  #       4 (2026-09-01, a 786,432-token target): CUDA OOM in graph capture.
+  #   5 (2026-09-01, mem-fraction 0.82 at the full 1M): OOM GONE -- capture
+  #       entered with 9.16-9.63 GB free instead of 488 MiB and cleared. Died
+  #       in the MTP draft model; see the speculative-decoding comment below.
+  #   6 (2026-09-01, attempt 5 without MTP): STARTED and registered at
+  #       context_window 1048576, max_total_num_tokens=460352,
+  #       available_gpu_mem=10.52 GB, 47.11 GB host KV per rank. Then crashed
+  #       on the FIRST request:
+  #         TypeError: 'NoneType' object is not subscriptable
+  #         hisparse_coordinator.py:535  req_idx = int(req_pool_indices_cpu[i])
+  #         <- map_last_loc_to_buffer <- schedule_batch.py:2568
+  #            prepare_for_decode
+  #       req_pool_indices_cpu defaults to None (schedule_batch.py:1609) and is
+  #       assigned only on the extend/alloc path (line 2094), so the DECODE
+  #       path hands HiSparse a None. That is an SGLang bug on the plain
+  #       decode path -- not hardware, not memory, not config. Profile B
+  #       cannot serve at any context length until the engine is fixed.
+  #       Re-test past SGLang 0.5.13.post1.
+  # Full logs: RESULTS-kv-tiering.md, section "Profile B (hisparse, long
+  # context)"; summary: dynamo/README.md, section "Tiered KV cache".
+  # NO throughput or latency numbers exist for Profile B; none are claimed.
+  #
+  # DO NOT reach for a smaller --context-length here. This comment used to
+  # name that as the promising untried lever, on the theory that the
+  # indexer's graph-capture working set scales with HiSparse's addressable
+  # range. Attempt 4 measured it and it is wrong: --mem-fraction-static fixes
+  # the static budget (weights + KV pool) and SGLang sizes the KV pool to
+  # fill whatever is left of that budget after the weights load, so the pool
+  # does NOT shrink with --context-length -- that flag only caps per-request
+  # length. Going 1M -> 768K freed no GPU memory at all; it merely moved the
+  # failure earlier (back into generic capture) and changed which rank ran
+  # out first (48 MiB free on GPU 1 vs attempt 3's 488 MiB on GPU 6). The
+  # only knob that actually resizes the pool is --mem-fraction-static. See
+  # the `--mem-fraction-static` and `--cuda-graph-max-bs` comments below for
+  # the attempts in detail.
   #
   # THE COST IS PREFIX CACHING, ENTIRELY, even setting the OOM aside. HiSparse
   # asserts --disable-radix-cache, so every request re-prefills from zero.
@@ -224,12 +302,15 @@ services:
     # together with --disable-radix-cache, which HiSparse requires.
     profiles: ["longctx"]
     environment:
-      <<: *dynamo-env
+      <<: [*dynamo-env, *coredump-env]
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
     volumes:
       - "${HF_CACHE:-/root/.cache/huggingface}:${HF_CACHE:-/root/.cache/huggingface}"
       - "dynamo-jit-cache:/home/dynamo/.cache"
+      # Crash-dump target (see x-coredump-env). This profile mounts no KV
+      # scratch tree, so the dump path must come in on its own mount.
+      - "${DIAG_DIR:-/scratch/diag}:${DIAG_DIR:-/scratch/diag}"
     # SGLang engine args pass straight through. We let SGLang AUTO-SELECT the DSA
     # attention backend (no --attention-backend): on Hopper with fp8 KV it picks
     # flashmla_kv for prefill+decode, same as the aggregated worker. Parsers are
@@ -249,7 +330,12 @@ services:
       - --enable-hisparse
       - --disable-radix-cache
       - '--hisparse-config={"top_k":2048,"device_buffer_size":${HISPARSE_DEVICE_BUFFER:-4096},"host_to_device_ratio":${HISPARSE_RATIO:-2}}'
-      # Does NOT start on this hardware at this default. Measured 2026-08-31:
+      # 0.82 is the ONLY value measured to start (attempt 5, 2026-09-01): it
+      # enters CUDA-graph capture with 9.16-9.63 GB free and clears it, where
+      # 0.88/0.86 both OOM'd. It costs KV pool -- max_total_num_tokens=460352,
+      # SMALLER than Profile A's 540928, with the remainder paging to ~377 GB
+      # of host memory (47.11 GB/rank). Do not raise it back without re-testing.
+      # History of the OOM attempts at the old 0.88 default, 2026-08-31:
       # Profile A at --mem-fraction-static 0.85 reports available_gpu_mem=
       # 10.09 GB/GPU. Raising to 0.88 (this default) consumes ~4.3 GB more of
       # that headroom, leaving ~5.8 GB -- 0.88 was chosen to leave that margin
@@ -263,7 +349,7 @@ services:
       # below for attempt 3. Full logs: RESULTS-kv-tiering.md, section
       # "Profile B (hisparse, long context)".
       - --context-length=${MAX_MODEL_LEN_LONG:-1048576}
-      - --mem-fraction-static=${MEM_FRACTION_LONG:-0.88}
+      - --mem-fraction-static=${MEM_FRACTION_LONG:-0.82}
       # SGLang defaults cuda_graph_max_bs to 512, but --max-running-requests caps
       # concurrency at 128, so graphs for batch sizes 129-512 can never be scheduled
       # -- they are pure wasted GPU memory. That waste is affordable under Profile A
@@ -282,15 +368,25 @@ services:
       # start -- see the header comment above for the lever that might close it.
       # Also shortens startup, since there are fewer graphs to capture.
       - --cuda-graph-max-bs=${CUDA_GRAPH_MAX_BS_LONG:-128}
-      # MTP/EAGLE is carried over UNVERIFIED: nothing in SGLang forbids it with
-      # HiSparse and nothing exercises it either. If startup fails citing
-      # speculative decoding, delete these four lines and re-run -- Profile B
-      # then loses the ~2x single-stream decode MTP provides, which must be
-      # recorded in RESULTS-kv-tiering.md.
-      - --speculative-algorithm=${SPEC_ALGO:-EAGLE}
-      - --speculative-num-steps=${SPEC_NUM_STEPS:-2}
-      - --speculative-eagle-topk=${SPEC_EAGLE_TOPK:-1}
-      - --speculative-num-draft-tokens=${SPEC_NUM_DRAFT:-3}
+      # NO MTP/EAGLE HERE -- IT IS BROKEN WITH HISPARSE, MEASURED 2026-09-01.
+      # This used to carry the same four speculative flags as Profile A,
+      # marked UNVERIFIED. Attempt 5 (mem-fraction 0.82, which cleared the
+      # CUDA-graph OOM that blocked attempts 1-4) got all the way past graph
+      # capture and then died in the MTP draft model on every one of the 8
+      # ranks:
+      #   AttributeError: 'HiSparseDSATokenToKVPool' object has no attribute
+      #                   'full_to_hisparse_device_index_mapping'
+      #   deepseek_nextn.py:227/350 -> deepseek_v2.py:1868 forward_absorb_core
+      # The attribute is installed by HiSparseDSATokenToKVPool.register_mapping()
+      # (mem_cache/hisparse_memory_pool.py), which hisparse_coordinator.py only
+      # calls for the main pool -- the NextN/MTP draft model gets its own pool
+      # instance that never has it registered. That is an SGLang integration
+      # gap, not a memory or config problem, so it cannot be tuned around from
+      # here. Re-test if the engine is ever upgraded past 0.5.13.post1.
+      #
+      # THE COST: Profile B gives up the ~2x single-stream decode that MTP
+      # provides under Profile A. Full detail: RESULTS-kv-tiering.md, section
+      # "Profile B attempt 5/6".
 
 volumes:
   etcd-data:

@@ -29,3 +29,11 @@ def kv_reaper():
 @pytest.fixture(scope="session")
 def bench_stream():
     return _load("bench_stream")
+
+
+@pytest.fixture(scope="session")
+def archive_script():
+    """Path to archive_worker_log.sh -- a shell CLI, so it is run, not imported."""
+    path = DYNAMO / "archive_worker_log.sh"
+    assert path.is_file(), f"missing {path}"
+    return path

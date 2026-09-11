@@ -1,9 +1,24 @@
-# NVIDIA Dynamo serving stack for GLM-5.2-FP8 on 8x H200.
+# Pin the Compose project name instead of inheriting it from the directory.
+# Inherited, it changes whenever the directory is renamed -- which silently
+# orphans the running containers (teardown matches nothing while the worker
+# holds all 8 GPUs) and the JIT cache volume (forcing a ~10-20 min DeepGEMM
+# recompile). This survived the dynamo/ -> sglang/ rename precisely because
+# it is pinned here.
+name: glm52-sglang
+
+# SGLang serving stack for GLM-5.2-FP8 on 8x H200.
 #
-# Engine: Dynamo SGLang backend (custom image: SGLang 0.5.13.post1). SGLang is
-# NVIDIA's blessed path for GLM-5 on Dynamo and auto-selects the DSA (DeepSeek-style
-# Sparse Attention) kernels for GLM-5.2. We use it because no Dynamo vLLM runtime
-# ships vLLM >= 0.23.0 yet (required by the vLLM path for head_size=704 sparse MLA).
+# Engine: SGLang 0.5.13.post1 (custom image, see Dockerfile), serving the
+# OpenAI-compatible API directly from sglang.launch_server. This used to run
+# under NVIDIA Dynamo (etcd + NATS + a frontend process in front of the same
+# worker); that was removed on 2026-09-11 because none of what Dynamo adds --
+# multi-worker discovery, KV-aware routing, disaggregated prefill/decode -- is
+# reachable on a single node with a single worker holding a ~756 GB model. The
+# engine, the image, and every engine flag below are unchanged by that removal.
+# SGLang auto-selects the DSA (DeepSeek-style Sparse Attention) kernels for
+# GLM-5.2. (The image derives from a Dynamo base purely because no published
+# vLLM runtime ships vLLM >= 0.23.0, which the vLLM path would need for
+# head_size=704 sparse MLA -- see Dockerfile.)
 #
 # Topology: single-node, AGGREGATED tensor-parallel over all 8 GPUs (TP=8) + MTP/EAGLE
 # speculative decoding. We benchmarked SGLang's "throughput" config (EP=8 +
@@ -15,12 +30,7 @@
 # config is the right choice only on >= 2 nodes / very high concurrency. (Disaggregated
 # prefill/decode -- a full model copy per worker -- also needs >= 2 nodes.)
 #
-# All services use host networking, so the frontend binds :8000 on the host and
-# workers reach etcd (:2379) / nats (:4222) over localhost.
-
-x-dynamo-env: &dynamo-env
-  ETCD_ENDPOINTS: "http://localhost:2379"
-  NATS_SERVER: "nats://localhost:4222"
+# The worker uses host networking and binds :8000 on the host directly.
 
 # Crash diagnostics for the SGLang worker. Merged into BOTH worker services
 # (workers only -- the frontend holds no CUDA context and needs none).
@@ -66,7 +76,7 @@ x-coredump-env: &coredump-env
 # whole keys wholesale, so profiles/environment/volumes/command stay spelled
 # out explicitly in each worker service rather than living here.
 x-worker-base: &worker-base
-  image: ${DYNAMO_IMAGE:-glm52-dynamo-sglang:0.5.13post1}
+  image: ${SGLANG_IMAGE:-glm52-sglang:0.5.13post1}
   network_mode: host
   gpus: all
   ipc: host
@@ -105,51 +115,10 @@ x-worker-base: &worker-base
   ulimits:
     memlock: -1
     stack: 67108864
-  depends_on: [etcd, nats]
-  entrypoint: ["python3", "-m", "dynamo.sglang"]
+  entrypoint: ["python3", "-m", "sglang.launch_server"]
   restart: "no"
 
 services:
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.21
-    network_mode: host
-    command:
-      - etcd
-      - --data-dir=/etcd-data
-      - --listen-client-urls=http://0.0.0.0:2379
-      - --advertise-client-urls=http://localhost:2379
-    volumes:
-      - etcd-data:/etcd-data
-    restart: unless-stopped
-
-  nats:
-    image: nats:2.10-alpine
-    network_mode: host
-    command: ["-js", "-m", "8222"]   # JetStream on, monitoring on :8222
-    restart: unless-stopped
-
-  frontend:
-    image: ${DYNAMO_IMAGE:-glm52-dynamo-sglang:0.5.13post1}
-    network_mode: host
-    environment:
-      <<: *dynamo-env
-      # The frontend loads the model's config/tokenizer (not weights) on discovery.
-      # Point it at the local HF cache + offline so it doesn't try huggingface.co
-      # (no internet/proxy in-container).
-      HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
-      HF_HUB_OFFLINE: "1"
-      # Bind the OpenAI HTTP API to loopback ONLY (not 0.0.0.0). The model should
-      # not be reachable directly over the network — front it with your own reverse
-      # proxy or expose it over a restricted SSH tunnel as needed.
-      # Override with HTTP_HOST=0.0.0.0 to re-expose (not recommended).
-      DYN_HTTP_HOST: "${HTTP_HOST:-127.0.0.1}"
-    volumes:
-      - "${HF_CACHE:-/root/.cache/huggingface}:${HF_CACHE:-/root/.cache/huggingface}"
-    depends_on: [etcd, nats]
-    entrypoint: ["python3", "-m", "dynamo.frontend"]
-    command: ["--http-port", "${PORT:-8000}"]
-    restart: unless-stopped
-
   # Aggregated worker: full model, tensor-parallel over all 8 GPUs (TP=8) + MTP.
   worker:
     <<: *worker-base
@@ -158,7 +127,7 @@ services:
     # together with --disable-radix-cache, which HiSparse requires.
     profiles: ["cache"]
     environment:
-      <<: [*dynamo-env, *coredump-env]
+      <<: *coredump-env
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
       # HiCacheFile defaults to /tmp/hicache -- the 438 GB ROOT filesystem --
@@ -171,7 +140,7 @@ services:
       # container recreation so restarts skip the ~10-20 min DeepGEMM precompile +
       # warmup. The cache dir exists in the image owned by the 'dynamo' user, so the
       # named volume inherits that ownership on first mount (writes succeed).
-      - "dynamo-jit-cache:/home/dynamo/.cache"
+      - "jit-cache:/home/dynamo/.cache"
       # L3 KV tier. Separate NVMe devices from /data (the weight cache), so
       # cache I/O does not contend with weight loading.
       - "${KV_SCRATCH_ROOT:-/scratch/kvcache}:${KV_SCRATCH_ROOT:-/scratch/kvcache}"
@@ -181,10 +150,17 @@ services:
       - "${DIAG_DIR:-/scratch/diag}:${DIAG_DIR:-/scratch/diag}"
     # SGLang engine args pass straight through. We let SGLang AUTO-SELECT the DSA
     # attention backend (no --attention-backend): on Hopper with fp8 KV it picks
-    # flashmla_kv for prefill+decode. Parsers are the Dynamo-side (frontend) parsers.
+    # flashmla_kv for prefill+decode.
     command:
       - --model-path=${MODEL:-zai-org/GLM-5.2-FP8}
       - --served-model-name=${SERVED_NAME:-glm-5.2-fp8}
+      # The engine now serves the OpenAI API itself -- there is no separate
+      # frontend process. network_mode: host means this binds the host's
+      # interface directly, so the default is loopback ONLY. The model should
+      # not be reachable over the network: front it with your own reverse proxy
+      # or an SSH tunnel. Override with HTTP_HOST=0.0.0.0 (not recommended).
+      - --host=${HTTP_HOST:-127.0.0.1}
+      - --port=${PORT:-8000}
       - --tp-size=${TP_SIZE:-8}
       - --kv-cache-dtype=fp8_e4m3
       - --mem-fraction-static=${MEM_FRACTION:-0.85}
@@ -202,8 +178,17 @@ services:
       # Override with MAX_MODEL_LEN if you change memory.
       - --context-length=${MAX_MODEL_LEN:-524288}
       - --trust-remote-code
-      - --dyn-tool-call-parser=glm47
-      - --dyn-reasoning-parser=glm45
+      # Native SGLang parsers. These were --dyn-* under Dynamo because the
+      # FRONTEND did the parsing; sglang.launch_server rejects that spelling.
+      - --tool-call-parser=glm47
+      - --reasoning-parser=glm45
+      # NOT OPTIONAL, and its absence is SILENT. This is what makes the server
+      # populate usage.prompt_tokens_details.cached_tokens, which bench_stream.py
+      # reads as a DIRECT count of prefix-cache hits -- the measurement behind
+      # the whole tiered-KV result in RESULTS-kv-tiering.md. The Dynamo frontend
+      # populated it for free. Drop this flag and there is no error: the field
+      # just disappears and cache effectiveness has to be guessed from TTFT.
+      - --enable-cache-report
       # MTP speculative decoding: GLM-5.2 ships 1 MTP layer; EAGLE drives it from the
       # main checkpoint (no separate draft model). topk=1 => a draft chain, so
       # num-draft-tokens == num-steps + 1. Verified to compose with the auto-selected
@@ -242,7 +227,7 @@ services:
       # The `file` backend deduplicates across TP ranks for MLA models (storage
       # keys carry no tp_rank suffix), so /scratch holds ONE copy, not eight.
       # That dedup is why the disk tier holds ~85x more unique tokens than all
-      # of host RAM. It has no eviction -- see dynamo/kv_reaper.py.
+      # of host RAM. It has no eviction -- see sglang/kv_reaper.py.
       - --hicache-storage-backend=file
       - --hicache-storage-prefetch-policy=timeout
 
@@ -273,7 +258,7 @@ services:
   #       cannot serve at any context length until the engine is fixed.
   #       Re-test past SGLang 0.5.13.post1.
   # Full logs: RESULTS-kv-tiering.md, section "Profile B (hisparse, long
-  # context)"; summary: dynamo/README.md, section "Tiered KV cache".
+  # context)"; summary: sglang/README.md, section "Tiered KV cache".
   # NO throughput or latency numbers exist for Profile B; none are claimed.
   #
   # DO NOT reach for a smaller --context-length here. This comment used to
@@ -302,29 +287,44 @@ services:
     # together with --disable-radix-cache, which HiSparse requires.
     profiles: ["longctx"]
     environment:
-      <<: [*dynamo-env, *coredump-env]
+      <<: *coredump-env
       HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
       HF_HUB_OFFLINE: "1"
     volumes:
       - "${HF_CACHE:-/root/.cache/huggingface}:${HF_CACHE:-/root/.cache/huggingface}"
-      - "dynamo-jit-cache:/home/dynamo/.cache"
+      - "jit-cache:/home/dynamo/.cache"
       # Crash-dump target (see x-coredump-env). This profile mounts no KV
       # scratch tree, so the dump path must come in on its own mount.
       - "${DIAG_DIR:-/scratch/diag}:${DIAG_DIR:-/scratch/diag}"
     # SGLang engine args pass straight through. We let SGLang AUTO-SELECT the DSA
     # attention backend (no --attention-backend): on Hopper with fp8 KV it picks
-    # flashmla_kv for prefill+decode, same as the aggregated worker. Parsers are
-    # the Dynamo-side (frontend) parsers.
+    # flashmla_kv for prefill+decode, same as the aggregated worker.
     command:
       - --model-path=${MODEL:-zai-org/GLM-5.2-FP8}
       - --served-model-name=${SERVED_NAME:-glm-5.2-fp8}
+      # The engine now serves the OpenAI API itself -- there is no separate
+      # frontend process. network_mode: host means this binds the host's
+      # interface directly, so the default is loopback ONLY. The model should
+      # not be reachable over the network: front it with your own reverse proxy
+      # or an SSH tunnel. Override with HTTP_HOST=0.0.0.0 (not recommended).
+      - --host=${HTTP_HOST:-127.0.0.1}
+      - --port=${PORT:-8000}
       - --tp-size=${TP_SIZE:-8}
       - --kv-cache-dtype=fp8_e4m3
       - --max-running-requests=${MAX_RUNNING:-128}
       - --page-size=${PAGE_SIZE:-64}
       - --trust-remote-code
-      - --dyn-tool-call-parser=glm47
-      - --dyn-reasoning-parser=glm45
+      # Native SGLang parsers. These were --dyn-* under Dynamo because the
+      # FRONTEND did the parsing; sglang.launch_server rejects that spelling.
+      - --tool-call-parser=glm47
+      - --reasoning-parser=glm45
+      # NOT OPTIONAL, and its absence is SILENT. This is what makes the server
+      # populate usage.prompt_tokens_details.cached_tokens, which bench_stream.py
+      # reads as a DIRECT count of prefix-cache hits -- the measurement behind
+      # the whole tiered-KV result in RESULTS-kv-tiering.md. The Dynamo frontend
+      # populated it for free. Drop this flag and there is no error: the field
+      # just disappears and cache effectiveness has to be guessed from TTFT.
+      - --enable-cache-report
       # HiSparse selects flashmla_kv itself for fp8_e4m3 KV -- the same backend
       # the aggregated worker auto-selects. Do NOT add --attention-backend.
       - --enable-hisparse
@@ -389,5 +389,4 @@ services:
       # "Profile B attempt 5/6".
 
 volumes:
-  etcd-data:
-  dynamo-jit-cache:   # persisted JIT kernel cache (fast worker restarts)
+  jit-cache:   # persisted JIT kernel cache (fast worker restarts)

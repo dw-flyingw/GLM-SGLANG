@@ -575,10 +575,10 @@ that directory, deleting the oldest files first until the tree fits.
 
 **Schedule** — a user crontab entry, no sudo required (the invoking user owns
 `/scratch/kvcache`). Crontab entries need an absolute path, so substitute
-your actual checkout location for `/path/to/GLM-5.2-FP8` below:
+your actual checkout location for `/path/to/GLM-SGLANG` below:
 
 ```cron
-*/15 * * * * /path/to/GLM-5.2-FP8/sglang/kv_reaper.py --root /scratch/kvcache/glm52 --max-bytes 10TB >> /scratch/kvcache/reaper.log 2>&1
+*/15 * * * * /path/to/GLM-SGLANG/sglang/kv_reaper.py --root /scratch/kvcache/glm52 --max-bytes 10TB >> /scratch/kvcache/reaper.log 2>&1
 ```
 
 Install with `crontab -e` (interactive; not automatable). The log is written to

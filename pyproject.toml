@@ -1,5 +1,5 @@
 [project]
-name = "glm-5-2-fp8"
+name = "glm-sglang"
 version = "0.1.0"
 description = "Serve GLM-5.2-FP8 on 8x H200 with SGLang"
 readme = "README.md"

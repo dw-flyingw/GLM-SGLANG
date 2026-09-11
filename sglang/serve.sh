@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# Serve GLM-5.2-FP8 via NVIDIA Dynamo (SGLang backend) on 8x H200, aggregated TP=8.
-# Brings up etcd + NATS + Dynamo frontend + one SGLang worker (full model, all GPUs).
+# Serve GLM-5.2-FP8 via SGLang on 8x H200, aggregated TP=8.
+# Brings up one SGLang worker (full model, all GPUs), serving the OpenAI API itself.
 #
 # Serves on host port 8000 (OpenAI-compatible). Set PORT= to change.
 #
 # Tunables (env): PORT, MAX_MODEL_LEN, MEM_FRACTION, TP_SIZE, PAGE_SIZE,
-#   HF_CACHE, MODEL, SERVED_NAME, DYNAMO_IMAGE, PROFILE, KV_SCRATCH_ROOT,
+#   HF_CACHE, MODEL, SERVED_NAME, SGLANG_IMAGE, PROFILE, KV_SCRATCH_ROOT,
 #   KV_SCRATCH_DIR, HICACHE_GB.  See docker-compose.yml.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-IMAGE="${DYNAMO_IMAGE:-glm52-dynamo-sglang:0.5.13post1}"
+IMAGE="${SGLANG_IMAGE:-glm52-sglang:0.5.13post1}"
 
 PROFILE="${PROFILE:-cache}"
 case "${PROFILE}" in
@@ -201,7 +201,7 @@ if [ -n "${PREV_WORKER}" ]; then
   ./archive_worker_log.sh "${PREV_WORKER}" "${DIAG_DIR}/logs" || true
 fi
 
-echo "Starting Dynamo (SGLang) stack for GLM-5.2-FP8 [profile: ${PROFILE}] ..."
+echo "Starting SGLang stack for GLM-5.2-FP8 [profile: ${PROFILE}] ..."
 docker compose --profile "${PROFILE}" up -d
 
 cat <<EOF
@@ -209,9 +209,11 @@ cat <<EOF
 Up. The model load + NSA/MTP warmup takes several minutes (756 GB of weights).
 
   Follow worker startup:   docker compose -f $(pwd)/docker-compose.yml logs -f ${WORKER_SERVICE}
-  Frontend logs:           docker compose -f $(pwd)/docker-compose.yml logs -f frontend
   Stop everything:         ./stop.sh
 
-Once the worker registers, test:
+Once the worker finishes loading, test:
+(:${PORT:-8000} does not accept connections until the engine is up, so an
+answered request is now a true readiness signal -- the old Dynamo frontend
+answered immediately with an empty model list.)
   curl http://localhost:${PORT:-8000}/v1/models
 EOF

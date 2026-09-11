@@ -124,3 +124,36 @@ def test_engine_tunables_are_unchanged(_docker_available):
         assert flag in rendered, f"engine tunable {flag!r} changed or lost"
     # SGLang must keep auto-selecting dsa/flashmla_kv.
     assert "--attention-backend" not in rendered
+
+
+SCRIPTS = ["serve.sh", "stop.sh", "bench.sh"]
+
+
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_scripts_use_the_renamed_image_var(script):
+    text = (COMPOSE.parent / script).read_text()
+    assert "DYNAMO_IMAGE" not in text
+    assert "glm52-dynamo-sglang" not in text
+
+
+def test_stop_warns_before_destroying_the_jit_cache():
+    """--volumes used to drop only the cheap etcd volume. The JIT cache is
+    now the only volume, so the same flag costs a 10-20 min DeepGEMM
+    recompile -- it has to say so at RUNTIME, not just in a comment.
+
+    Asserted on behavior, not vocabulary: stop.sh may still explain what
+    etcd was, it just may not still claim to be keeping its volume.
+    """
+    text = (COMPOSE.parent / "stop.sh").read_text()
+    assert "Keeps the etcd data volume" not in text
+    assert "drop the etcd volume" not in text
+    # The warning must be echoed, i.e. reachable at runtime.
+    assert "WARNING: --volumes will delete the JIT kernel cache volume." in text
+    assert "--volumes|-v)" in text
+
+
+@pytest.mark.parametrize("script", SCRIPTS + ["archive_worker_log.sh"])
+def test_scripts_are_syntactically_valid(script):
+    path = COMPOSE.parent / script
+    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

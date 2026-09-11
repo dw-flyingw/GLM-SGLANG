@@ -209,11 +209,24 @@ are unchanged by this migration — so the measurements carry over.
 Not executed as part of this work. The live stack keeps serving until the operator runs
 this. Written into `sglang/README.md`.
 
-```bash
-# 1. Tear down the old stack (archives the worker log first).
-cd dynamo && ./stop.sh
+Note that by the time the operator runs this, `dynamo/` no longer exists — the rename
+has landed — so the old stack cannot be torn down by its own `stop.sh`. It is reached by
+project name instead. Verified: `docker compose -p dynamo ps` resolves the running
+project from container labels with no compose file present (`config` does not, but
+`ps`/`down` do).
 
-# 2. One-time: carry the JIT kernel cache across the project rename,
+```bash
+# 1. Archive the old worker's log BEFORE teardown -- docker deletes a
+#    container's log with the container, and that log is the only place
+#    SGLang's watchdog writes its per-rank py-spy dump.
+#    archive_worker_log.sh takes a container id, so it works fine from its
+#    new location against the old container.
+./sglang/archive_worker_log.sh dynamo-worker-1 /scratch/diag/logs
+
+# 2. Tear down the old stack by project name.
+docker compose -p dynamo down
+
+# 3. One-time: carry the JIT kernel cache across the project rename,
 #    avoiding a ~10-20 min DeepGEMM recompile on first start.
 docker volume create glm52-sglang_jit-cache
 docker run --rm \
@@ -221,16 +234,16 @@ docker run --rm \
   -v glm52-sglang_jit-cache:/to \
   alpine sh -c 'cp -a /from/. /to/'
 
-# 3. One-time: retag the existing image so serve.sh does not rebuild it
+# 4. One-time: retag the existing image so serve.sh does not rebuild it
 #    (the rebuild needs host networking + a pip proxy).
 docker tag glm52-dynamo-sglang:0.5.13post1 glm52-sglang:0.5.13post1
 
-# 4. Start.
+# 5. Start.
 cd ../sglang && ./serve.sh
 docker compose logs -f worker
 ```
 
-Step 3 matters: `serve.sh` builds the image only when it is absent, so a renamed default
+Step 4 matters: `serve.sh` builds the image only when it is absent, so a renamed default
 tag would trigger a full rebuild through the proxy on an otherwise offline host.
 
 ## Verification
@@ -263,9 +276,9 @@ is dropped.
 | Risk | Mitigation |
 |---|---|
 | `--enable-cache-report` omitted or later removed | Verification check 3; a load-bearing comment at the flag |
-| Old stack left running, holding 8 GPUs | Runbook step 1 runs `./stop.sh` from `dynamo/` **before** the rename takes effect in the operator's shell |
-| Forced DeepGEMM recompile | Runbook step 2 migrates the volume; worst case is a slow first boot, not a failure |
-| Accidental image rebuild on an offline host | Runbook step 3 retags |
+| Old stack left running, holding 8 GPUs | Runbook step 2 tears it down by project name (`docker compose -p dynamo down`), which works after the rename because Compose resolves a running project from container labels |
+| Forced DeepGEMM recompile | Runbook step 3 migrates the volume; worst case is a slow first boot, not a failure |
+| Accidental image rebuild on an offline host | Runbook step 4 retags |
 | Something unforeseen in the native server | Rollback is `git revert` + `./serve.sh` from the restored `dynamo/`. The old image is untouched on disk under its original tag, and no engine flag changed, so the old stack comes back bit-identical. |
 
 Rollback cost is one worker restart. No data migration is involved: the `/scratch` L3 KV

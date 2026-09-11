@@ -1,4 +1,4 @@
-"""Regression tests for dynamo/archive_worker_log.sh.
+"""Regression tests for sglang/archive_worker_log.sh.
 
 The 2026-09-03 exit-137 hang was un-diagnosable for two independent reasons.
 The first (py-spy denied by Yama ptrace_scope=1) is fixed by `cap_add:

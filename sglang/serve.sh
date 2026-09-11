@@ -171,7 +171,7 @@ this script. A container write probe to that directory failed.
   sudo chmod -R 2775 ${KV_SCRATCH_ROOT}
 
 Why: owner 1000 so the container can write; group kept as your host group
-with g+w so the host-side reaper (dynamo/kv_reaper.py, run from cron as the
+with g+w so the host-side reaper (sglang/kv_reaper.py, run from cron as the
 host user) can still delete what the container creates; setgid (2775) so
 new files/dirs the container creates inherit that group. (Targets
 KV_SCRATCH_ROOT, the whole bind-mounted tree, not just KV_SCRATCH_DIR --

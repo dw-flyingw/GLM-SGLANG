@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny streaming benchmark for the GLM-5.2-FP8 Dynamo (SGLang) OpenAI endpoint.
+"""Tiny streaming benchmark for the GLM-5.2-FP8 SGLang OpenAI endpoint.
 
 Stdlib only (no aiperf/genai-perf/tokenizer needed — those aren't in the runtime
 image and an offline environment can't fetch a corpus for sglang.bench_serving). Measures
@@ -126,10 +126,12 @@ def one_request(prompt, max_tokens, no_think):
             if usage:
                 completion_tokens = usage.get("completion_tokens")
                 prompt_tokens = usage.get("prompt_tokens")
-                # OpenAI-shaped cache accounting. If the Dynamo frontend
-                # populates it, this is a DIRECT read of prefix-cache hits
-                # rather than a TTFT inference -- worth far more than the
+                # OpenAI-shaped cache accounting -- a DIRECT read of prefix-cache
+                # hits rather than a TTFT inference, worth far more than the
                 # timing numbers for verifying the tiering actually works.
+                # The server populates this because --enable-cache-report is set
+                # in docker-compose.yml; WITHOUT that flag the field is silently
+                # absent and this reads None.
                 cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
             choices = obj.get("choices") or []
             if not choices:

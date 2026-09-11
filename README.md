@@ -1,13 +1,15 @@
-# GLM-5.2-FP8 on NVIDIA Dynamo (SGLang, 8× H200)
+# GLM-5.2-FP8 on SGLang (8× H200)
 
 Serves [`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8) on a single node
-across all 8 H200 GPUs via **NVIDIA Dynamo** with the **SGLang** backend, exposing an
-OpenAI-compatible API on `:8000`.
+across all 8 H200 GPUs with **SGLang**, exposing an OpenAI-compatible API on `:8000`.
 
-> Previously this repo served the model with a plain vLLM container (`serve.sh`). That
-> path was removed in favor of Dynamo/SGLang — see `dynamo/` for the full setup and the
-> `dynamo/README.md` for the why (vLLM ≥ 0.23.0 isn't available in any Dynamo runtime
-> yet; SGLang 0.5.13.post1 is the supported engine for GLM-5.2's sparse attention).
+> This repo has served the model two ways before: a plain vLLM container, and then
+> NVIDIA Dynamo with the SGLang backend. vLLM was dropped because no Dynamo runtime
+> ships vLLM ≥ 0.23.0, which GLM-5.2's sparse MLA needs. Dynamo itself was dropped on
+> 2026-09-11: its frontend duplicated `sglang.launch_server`, and multi-worker
+> discovery, KV-aware routing, and disaggregated prefill/decode are all unreachable on
+> a single node holding one ~756 GB model. The engine has been SGLang throughout, and
+> no engine flag changed when Dynamo was removed. See `sglang/README.md`.
 
 ## Model
 
@@ -30,7 +32,7 @@ sudo chmod -R 2775 /scratch/kvcache
 ```
 
 Owner `1000` so the container can write; your host group kept with `g+w` so the
-reaper (`dynamo/kv_reaper.py`, run from cron as the host user) can still delete
+reaper (`sglang/kv_reaper.py`, run from cron as the host user) can still delete
 what the container creates; setgid so new files inherit that group. `serve.sh`
 prints these same two commands if its probe fails.
 
@@ -46,7 +48,7 @@ erroring — a permissions mismatch here would otherwise start the worker clean
 with a dead L3 cache tier and no warning.
 
 ```bash
-cd dynamo
+cd sglang
 PROFILE=cache ./serve.sh         # default: 512K context + tiered KV cache (GPU->host RAM->/scratch)
 # PROFILE=longctx ./serve.sh     # attempts the model's full 1M context via HiSparse instead;
 #                                 # does NOT currently start on this hardware (CUDA OOM during
@@ -55,7 +57,7 @@ docker compose logs -f worker    # watch startup (first boot is slow; see below)
 ./stop.sh                        # stop + remove the stack
 ```
 
-The stack = etcd + NATS + Dynamo frontend + one SGLang worker (aggregated, TP=8,
+The stack = one SGLang worker (aggregated, TP=8,
 auto-selected DSA attention backend (`flashmla_kv` on Hopper+fp8), fp8 KV cache,
 **MTP/EAGLE speculative decoding on** — ~2× single-stream decode). Under the
 default `PROFILE=cache`, context is served at **512K** (`--context-length
@@ -64,7 +66,7 @@ NVMe) so that evicted prefixes can still be served from cache instead of
 recomputed. That protection is not free: measured conc-32 system throughput
 drops to **1905.2 tok/s from a 2087.1 tok/s baseline (~9%)** under the
 default write policy, while conc-1 decode is unaffected (149.8 vs 150.6
-tok/s) — see [`dynamo/README.md`](dynamo/README.md#tiered-kv-cache) for the
+tok/s) — see [`sglang/README.md`](sglang/README.md#tiered-kv-cache) for the
 full breakdown. The model's 1M max is not servable on one node with full
 fidelity: the measured KV pool tops out at ~541K tokens alongside the
 weights, and `PROFILE=longctx` — the single-node attempt at the full 1M
@@ -73,7 +75,7 @@ context via SGLang HiSparse — fails to initialize on this hardware (see
 prefill/decode is **not possible on a single node** for this model (a full
 copy per worker exceeds 8 GPUs) — it needs ≥ 2 nodes, and so does a
 full-fidelity 1M context.
-Details, tunables, and benchmarks: [`dynamo/README.md`](dynamo/README.md).
+Details, tunables, and benchmarks: [`sglang/README.md`](sglang/README.md).
 
 > First start runs a DeepGEMM JIT pre-compile + CUDA-graph capture (~10–20 min). It's
 > cacheable with `python3 -m sglang.compile_deep_gemm` (same args).

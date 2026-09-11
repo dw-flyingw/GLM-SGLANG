@@ -52,13 +52,13 @@ Pure rename. No behavior change, no Dynamo removal yet — that keeps this task 
 
 - [ ] **Step 1: Confirm the test suite passes before touching anything**
 
-Run: `cd /home/users/wrightda/src/GLM-5.2-FP8 && python3 -m pytest tests/ -q`
+Run: `python3 -m pytest tests/ -q`
 Expected: all tests pass. If they do not, stop and report — this plan assumes a green baseline.
 
 - [ ] **Step 2: Do the rename**
 
 ```bash
-cd /home/users/wrightda/src/GLM-5.2-FP8
+cd "$(git rev-parse --show-toplevel)"
 git mv dynamo sglang
 ls sglang/.env    # must still exist (untracked, moved by the filesystem)
 ```
@@ -67,7 +67,7 @@ ls sglang/.env    # must still exist (untracked, moved by the filesystem)
 
 - [ ] **Step 3: Run the tests to verify they now fail**
 
-Run: `python3 -m pytest tests/ -q`
+Run (from the repo root): `python3 -m pytest tests/ -q`
 Expected: FAIL — `conftest.py` still points at `parents[1] / "dynamo"`, so `_load` raises on a missing file and the `archive_script` fixture's `assert path.is_file()` trips.
 
 - [ ] **Step 4: Repoint `tests/conftest.py`**
@@ -106,7 +106,7 @@ Line 1: `"""Regression tests for dynamo/archive_worker_log.sh.` → `"""Regressi
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `python3 -m pytest tests/ -q`
+Run (from the repo root): `python3 -m pytest tests/ -q`
 Expected: PASS, with the same test count as Step 1.
 
 - [ ] **Step 7: Verify no stale `dynamo/` path references remain in test or tooling code**
@@ -598,7 +598,7 @@ Two edits:
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `python3 -m pytest tests/ -q`
+Run (from the repo root): `python3 -m pytest tests/ -q`
 Expected: PASS, all tests including the three new ones.
 
 - [ ] **Step 7: Verify `stop.sh`'s warning fires without running docker**
@@ -801,7 +801,7 @@ Expected: only *intentional historical* mentions remain — the migration note i
 
 - [ ] **Step 9: Run the full suite**
 
-Run: `python3 -m pytest tests/ -q`
+Run (from the repo root): `python3 -m pytest tests/ -q`
 Expected: PASS, all tests.
 
 - [ ] **Step 10: Confirm the live stack is still untouched**

@@ -1,7 +1,15 @@
-# GLM-5.2-FP8 on SGLang (8× H200)
+# GLM on SGLang (8× H200)
 
-Serves [`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8) on a single node
-across all 8 H200 GPUs with **SGLang**, exposing an OpenAI-compatible API on `:8000`.
+An SGLang serving stack for GLM-family models on a single 8× H200 node, exposing an
+OpenAI-compatible API on `:8000`.
+
+**Currently configured for and measured against
+[`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8).** The served model is
+the `MODEL` env var, but swapping it is not just a variable change — the context length,
+memory fraction, page size, parsers, and speculative-decoding setup are all tuned to this
+model, and every benchmark in this repo was measured on it. See
+[Serving a different GLM model](sglang/README.md#serving-a-different-glm-model) for what
+has to be re-checked.
 
 > This repo has served the model two ways before: a plain vLLM container, and then
 > NVIDIA Dynamo with the SGLang backend. vLLM was dropped because no Dynamo runtime

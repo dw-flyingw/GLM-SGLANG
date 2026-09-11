@@ -1,8 +1,13 @@
-# GLM-5.2-FP8 on SGLang (8× H200)
+# GLM on SGLang (8× H200)
 
-Serves `zai-org/GLM-5.2-FP8` on a single node with **SGLang**, which serves the
-OpenAI-compatible API itself on host port `:8000` from `sglang.launch_server`.
+An SGLang serving stack for GLM-family models on a single 8× H200 node. SGLang serves
+the OpenAI-compatible API itself on host port `:8000` from `sglang.launch_server`.
 One container, no orchestration layer.
+
+**Currently serving `zai-org/GLM-5.2-FP8`** — the model is the `MODEL` env var, and
+every default below, every measurement, and the whole of
+[`RESULTS-kv-tiering.md`](RESULTS-kv-tiering.md) is specific to it. See
+[Serving a different GLM model](#serving-a-different-glm-model) before changing it.
 
 This used to run under NVIDIA Dynamo (etcd + NATS + a frontend process in front of
 the same worker). Dynamo was removed on 2026-09-11: its frontend duplicated
@@ -87,11 +92,52 @@ Tunables (env): `PORT`, `MAX_MODEL_LEN` (→ sglang `--context-length`, default 
 `MAX_RUNNING` (→ `--max-running-requests`, default 128 — the concurrency ceiling;
 spec decoding would otherwise auto-cap it to 48),
 `HF_CACHE` (default `/root/.cache/huggingface`), `MODEL`, `SERVED_NAME`, `SGLANG_IMAGE`,
+`TOOL_PARSER` (default `glm47`), `REASONING_PARSER` (default `glm45`),
 `HTTP_HOST` (default `127.0.0.1` — the worker binds the host interface directly under
 `network_mode: host`, so this is loopback-only unless you change it).
 MTP speculative decoding is on by default; tune via `SPEC_ALGO` (default `EAGLE`),
 `SPEC_NUM_STEPS` (2), `SPEC_EAGLE_TOPK` (1), `SPEC_NUM_DRAFT` (3), or disable by
 editing the worker `command:` in `docker-compose.yml`.
+
+## Serving a different GLM model
+
+Set `MODEL` and `SERVED_NAME` and the stack will start — but starting is not the bar.
+Every default in this repo was chosen for GLM-5.2-FP8's architecture and weight size,
+and several of them fail *quietly* on a different model. Work through this list:
+
+| Knob | Env | Why it is GLM-5.2-specific |
+|---|---|---|
+| Tool-call parser | `TOOL_PARSER` (default `glm47`) | Parser names are per-model-family. A wrong one does not error — tool calls just come back as plain text. |
+| Reasoning parser | `REASONING_PARSER` (default `glm45`) | Same failure shape: `reasoning_content` silently stops being split out. |
+| Page size | `PAGE_SIZE` (default `64`) | Required by GLM-5.2's **DSA indexer**. A model without DSA has no such constraint. |
+| Speculative decoding | `SPEC_*` (default EAGLE/2/1/3) | GLM-5.2 ships **1 MTP layer** that EAGLE drives from the main checkpoint. A model with no MTP layer cannot use this — the four flags must come out. |
+| Context length | `MAX_MODEL_LEN` (default `524288`) | 512K is not the model's max (1M is); it is what fits *next to ~756 GB of weights*. Different weights → different KV pool → different ceiling. |
+| Memory fraction | `MEM_FRACTION` (default `0.85`) | Tuned so weights + KV pool + CUDA-graph capture fit in 141 GB/GPU. This is the knob that actually resizes the pool. |
+| L2 host pool | `HICACHE_GB` (default `96`) | Per TP rank, so ×8. Sized against this model's per-token KV footprint. |
+| KV dtype | hardcoded `fp8_e4m3` | Paired with an FP8 checkpoint. Revisit for a bf16 model. |
+
+To check which parser names the image actually accepts, ask it rather than guessing —
+a name that is not in the list is rejected at startup, and a name that is in the list
+but wrong for the model fails silently:
+
+```bash
+docker run --rm --entrypoint python3 ${SGLANG_IMAGE:-glm52-sglang:0.5.13post1} -c "
+from sglang.srt.server_args import ServerArgs
+import argparse
+p = argparse.ArgumentParser(); ServerArgs.add_cli_args(p)
+for a in p._actions:
+    if a.dest in ('tool_call_parser','reasoning_parser'): print(a.dest, a.choices)"
+```
+
+Also confirm the image's SGLang build **registers the new architecture** — that is the
+whole reason this repo pins 0.5.13.post1 rather than the base image's 0.5.12.post1 (see
+`Dockerfile`). A model whose arch is unregistered fails at load with a shape mismatch,
+not a clear "unsupported" message.
+
+Finally: **none of the numbers in this repo transfer.** `RESULTS-kv-tiering.md`, the
+MTP speculative-decoding table, and the EP+DP-attention comparison are all GLM-5.2-FP8
+on this hardware. Re-measure with `bench_stream.py` before quoting any of them for
+another model.
 
 ## Cutover from the Dynamo stack
 
@@ -151,7 +197,9 @@ tag and `dynamo_dynamo-jit-cache` is copied rather than moved, so both are intac
   `dsa`/`flashmla_kv` (Hopper + fp8 KV). Verified ~+8% system tok/s at conc 32 vs the
   legacy `nsa` backend we used to force.
 - `--tool-call-parser glm47`, `--reasoning-parser glm45` (native SGLang parsers; these
-  were `--dyn-*` under Dynamo, where the frontend did the parsing)
+  were `--dyn-*` under Dynamo, where the frontend did the parsing). Both are
+  env-overridable (`TOOL_PARSER` / `REASONING_PARSER`) because parser names are
+  per-model-family — see [Serving a different GLM model](#serving-a-different-glm-model)
 - **`--enable-cache-report`** — makes the server populate
   `usage.prompt_tokens_details.cached_tokens`. Not optional: `bench_stream.py` reads it
   as a direct count of prefix-cache hits, and without the flag the field is *silently*

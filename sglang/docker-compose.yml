@@ -6,7 +6,9 @@
 # it is pinned here.
 name: glm52-sglang
 
-# SGLang serving stack for GLM-5.2-FP8 on 8x H200.
+# SGLang serving stack for GLM-family models on 8x H200.
+# Currently configured for GLM-5.2-FP8 (${MODEL}); every default below is tuned to
+# that model -- see README.md, "Serving a different GLM model", before swapping it.
 #
 # Engine: SGLang 0.5.13.post1 (custom image, see Dockerfile), serving the
 # OpenAI-compatible API directly from sglang.launch_server. This used to run
@@ -180,8 +182,8 @@ services:
       - --trust-remote-code
       # Native SGLang parsers. These were --dyn-* under Dynamo because the
       # FRONTEND did the parsing; sglang.launch_server rejects that spelling.
-      - --tool-call-parser=glm47
-      - --reasoning-parser=glm45
+      - --tool-call-parser=${TOOL_PARSER:-glm47}
+      - --reasoning-parser=${REASONING_PARSER:-glm45}
       # NOT OPTIONAL, and its absence is SILENT. This is what makes the server
       # populate usage.prompt_tokens_details.cached_tokens, which bench_stream.py
       # reads as a DIRECT count of prefix-cache hits -- the measurement behind
@@ -316,8 +318,8 @@ services:
       - --trust-remote-code
       # Native SGLang parsers. These were --dyn-* under Dynamo because the
       # FRONTEND did the parsing; sglang.launch_server rejects that spelling.
-      - --tool-call-parser=glm47
-      - --reasoning-parser=glm45
+      - --tool-call-parser=${TOOL_PARSER:-glm47}
+      - --reasoning-parser=${REASONING_PARSER:-glm45}
       # NOT OPTIONAL, and its absence is SILENT. This is what makes the server
       # populate usage.prompt_tokens_details.cached_tokens, which bench_stream.py
       # reads as a DIRECT count of prefix-cache hits -- the measurement behind

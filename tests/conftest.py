@@ -1,4 +1,4 @@
-"""Load dynamo/ scripts as importable modules.
+"""Load sglang/ scripts as importable modules.
 
 They are standalone CLIs, not a package, so there is nothing to `import`.
 Session-scoped: loading is cheap but neither module has import side effects
@@ -10,11 +10,11 @@ import sys
 
 import pytest
 
-DYNAMO = pathlib.Path(__file__).resolve().parents[1] / "dynamo"
+SGLANG = pathlib.Path(__file__).resolve().parents[1] / "sglang"
 
 
 def _load(name):
-    spec = importlib.util.spec_from_file_location(name, DYNAMO / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, SGLANG / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -34,6 +34,6 @@ def bench_stream():
 @pytest.fixture(scope="session")
 def archive_script():
     """Path to archive_worker_log.sh -- a shell CLI, so it is run, not imported."""
-    path = DYNAMO / "archive_worker_log.sh"
+    path = SGLANG / "archive_worker_log.sh"
     assert path.is_file(), f"missing {path}"
     return path

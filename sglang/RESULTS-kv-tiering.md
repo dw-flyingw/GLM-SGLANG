@@ -1,5 +1,11 @@
 # KV cache tiering: measured results
 
+> **Measured 2026-08-31/09-01 on the NVIDIA Dynamo + SGLang 0.5.13.post1 stack**, before
+> Dynamo was removed (2026-09-11). The engine, the image, and every engine flag are
+> unchanged by that removal, so these numbers carry over; only the wrapper around them
+> is gone. Dynamo references below are left as written -- this is a record of what was
+> measured, not a description of the current stack.
+
 Date: 2026-08-31
 Image tag: `glm52-dynamo-sglang:0.5.13post1`
 

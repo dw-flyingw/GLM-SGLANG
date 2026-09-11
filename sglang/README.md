@@ -1,8 +1,23 @@
-# GLM-5.2-FP8 on NVIDIA Dynamo (SGLang backend, 8× H200)
+# GLM on SGLang (8× H200)
 
-Serves `zai-org/GLM-5.2-FP8` on a single node using **NVIDIA Dynamo** as the
-serving/orchestration layer, OpenAI-compatible on host port `:8000`. This is the
-project's serving path (the earlier plain-vLLM container was removed).
+An SGLang serving stack for GLM-family models on a single 8× H200 node. SGLang serves
+the OpenAI-compatible API itself on host port `:8000` from `sglang.launch_server`.
+One container, no orchestration layer.
+
+**Currently serving `zai-org/GLM-5.2-FP8`** — the model is the `MODEL` env var, and
+every default below, every measurement, and the whole of
+[`RESULTS-kv-tiering.md`](RESULTS-kv-tiering.md) is specific to it. See
+[Serving a different GLM model](#serving-a-different-glm-model) before changing it.
+
+This used to run under NVIDIA Dynamo (etcd + NATS + a frontend process in front of
+the same worker). Dynamo was removed on 2026-09-11: its frontend duplicated
+`sglang.launch_server`, and the three things it added over that — multi-worker
+discovery, KV-aware routing, and disaggregated prefill/decode — are all unreachable
+on a single node holding one ~756 GB copy of the model. The engine, the image, and
+every engine flag are unchanged by the removal, so every measurement in
+[`RESULTS-kv-tiering.md`](RESULTS-kv-tiering.md) carries over. See
+[Cutover from the Dynamo stack](#cutover-from-the-dynamo-stack) for the one-time
+migration.
 
 ## Why SGLang, not vLLM
 
@@ -12,8 +27,9 @@ with `head_size=704`. The vLLM path needs **vLLM ≥ 0.23.0** for that.
 Verified (2026-06-27): **no published Dynamo `vllm-runtime` image, nor the
 `ai-dynamo` PyPI wheel, ships vLLM ≥ 0.23.0.**
 `1.2.1`→0.20.1, `1.3.0-dev.1`→0.22.0 (its sparse-MLA backends cap at `head_size=576`),
-`kimi-k2.6-dev`→0.21.0. So we use Dynamo's **SGLang** backend — NVIDIA's own GLM-5
-Dynamo recipe (`ai-dynamo/dynamo/recipes/glm-5-nvfp4`) is SGLang too.
+`kimi-k2.6-dev`→0.21.0. So we use **SGLang** — NVIDIA's own GLM-5 recipe
+(`ai-dynamo/dynamo/recipes/glm-5-nvfp4`) is SGLang too. Dynamo itself is no longer
+used; the image it gave us is — see the `Dockerfile`.
 
 Our custom image (see `Dockerfile`) bundles **SGLang 0.5.13.post1**, which registers
 `GlmMoeDsaForCausalLM` and **auto-selects the DSA attention backend** for this arch: on
@@ -30,37 +46,149 @@ that's ~12 GPUs, impossible on a single 8-GPU node (TP4 = 189 GB/GPU > 143 GB). 
 own GLM-5 recipe is therefore 5 nodes / 20 GPUs. **Disaggregation here needs ≥ 2 nodes.**
 
 On one node the only fit is **aggregated, tensor-parallel over all 8 GPUs** — what this
-stack does. Dynamo still adds: an OpenAI frontend + runtime/observability, KV-aware
-routing (kicks in once you scale to multiple replicas/nodes), request migration, and a
-clean path to multi-node disaggregation later.
+stack does. This is also why Dynamo was removed: everything it added over plain SGLang
+(KV-aware routing, request migration, a path to multi-node disaggregation) only starts
+paying at ≥ 2 workers or ≥ 2 nodes, which one 756 GB model copy on 8 GPUs cannot reach.
+If this ever grows to a second node, reintroducing an orchestration layer is the right
+move — and none of the engine configuration below would need to change to do it.
 
 ## Layout
 
-- `docker-compose.yml` — etcd + NATS + Dynamo frontend + one SGLang worker (TP=8). Host
+- `docker-compose.yml` — one SGLang worker (TP=8), serving the OpenAI API itself. Host
   networking; tunables via `${...}` env (see below).
 - `serve.sh` / `stop.sh` — bring the stack up / down.
 - `archive_worker_log.sh` — copy a worker's docker log somewhere durable before
   the container is removed. Called automatically by both of the above.
-- `bench.sh` — load-test any OpenAI endpoint (Dynamo or vLLM) with aiperf/genai-perf.
+- `bench.sh` — load-test any OpenAI endpoint with aiperf/genai-perf.
 
 ## Usage
 
 ```bash
-cd dynamo
+cd sglang
 ./serve.sh                       # start (detached)
 docker compose logs -f worker    # watch model load (several minutes, 756 GB)
 curl http://localhost:8000/v1/models
 ./stop.sh
 ```
 
+`:8000` does not accept connections until the engine has finished loading, so an
+answered request is a true readiness signal. (Under Dynamo the frontend answered
+immediately and `/v1/models` returned an empty list until the worker registered.)
+
+### Operational endpoints
+
+The engine serves the API itself, which exposes endpoints the Dynamo frontend did not
+proxy — all on `${HTTP_HOST:-127.0.0.1}` like everything else, so the exposure posture
+is unchanged:
+
+| Endpoint | Use |
+|---|---|
+| `/health`, `/health_generate` | liveness / can-it-actually-decode |
+| `/get_server_info` | the engine's effective config, without grepping the boot log |
+| `/flush_cache` | drop the prefix cache between benchmark runs — this replaces a full worker restart, which is how eviction tests were staged before |
+
 Tunables (env): `PORT`, `MAX_MODEL_LEN` (→ sglang `--context-length`, default 524288),
 `MEM_FRACTION` (default 0.85), `TP_SIZE` (default 8), `PAGE_SIZE` (default 64, DSA),
 `MAX_RUNNING` (→ `--max-running-requests`, default 128 — the concurrency ceiling;
 spec decoding would otherwise auto-cap it to 48),
-`HF_CACHE` (default `/root/.cache/huggingface`), `MODEL`, `SERVED_NAME`, `DYNAMO_IMAGE`.
+`HF_CACHE` (default `/root/.cache/huggingface`), `MODEL`, `SERVED_NAME`, `SGLANG_IMAGE`,
+`TOOL_PARSER` (default `glm47`), `REASONING_PARSER` (default `glm45`),
+`HTTP_HOST` (default `127.0.0.1` — the worker binds the host interface directly under
+`network_mode: host`, so this is loopback-only unless you change it).
 MTP speculative decoding is on by default; tune via `SPEC_ALGO` (default `EAGLE`),
 `SPEC_NUM_STEPS` (2), `SPEC_EAGLE_TOPK` (1), `SPEC_NUM_DRAFT` (3), or disable by
 editing the worker `command:` in `docker-compose.yml`.
+
+## Serving a different GLM model
+
+Set `MODEL` and `SERVED_NAME` and the stack will start — but starting is not the bar.
+Every default in this repo was chosen for GLM-5.2-FP8's architecture and weight size,
+and several of them fail *quietly* on a different model. Work through this list:
+
+| Knob | Env | Why it is GLM-5.2-specific |
+|---|---|---|
+| Tool-call parser | `TOOL_PARSER` (default `glm47`) | Parser names are per-model-family. A wrong one does not error — tool calls just come back as plain text. |
+| Reasoning parser | `REASONING_PARSER` (default `glm45`) | Same failure shape: `reasoning_content` silently stops being split out. |
+| Page size | `PAGE_SIZE` (default `64`) | Required by GLM-5.2's **DSA indexer**. A model without DSA has no such constraint. |
+| Speculative decoding | `SPEC_*` (default EAGLE/2/1/3) | GLM-5.2 ships **1 MTP layer** that EAGLE drives from the main checkpoint. A model with no MTP layer cannot use this — the four flags must come out. |
+| Context length | `MAX_MODEL_LEN` (default `524288`) | 512K is not the model's max (1M is); it is what fits *next to ~756 GB of weights*. Different weights → different KV pool → different ceiling. |
+| Memory fraction | `MEM_FRACTION` (default `0.85`) | Tuned so weights + KV pool + CUDA-graph capture fit in 141 GB/GPU. This is the knob that actually resizes the pool. |
+| L2 host pool | `HICACHE_GB` (default `96`) | Per TP rank, so ×8. Sized against this model's per-token KV footprint. |
+| KV dtype | hardcoded `fp8_e4m3` | Paired with an FP8 checkpoint. Revisit for a bf16 model. |
+
+To check which parser names the image actually accepts, ask it rather than guessing —
+a name that is not in the list is rejected at startup, and a name that is in the list
+but wrong for the model fails silently:
+
+```bash
+docker run --rm --entrypoint python3 ${SGLANG_IMAGE:-glm52-sglang:0.5.13post1} -c "
+from sglang.srt.server_args import ServerArgs
+import argparse
+p = argparse.ArgumentParser(); ServerArgs.add_cli_args(p)
+for a in p._actions:
+    if a.dest in ('tool_call_parser','reasoning_parser'): print(a.dest, a.choices)"
+```
+
+Also confirm the image's SGLang build **registers the new architecture** — that is the
+whole reason this repo pins 0.5.13.post1 rather than the base image's 0.5.12.post1 (see
+`Dockerfile`). A model whose arch is unregistered fails at load with a shape mismatch,
+not a clear "unsupported" message.
+
+Finally: **none of the numbers in this repo transfer.** `RESULTS-kv-tiering.md`, the
+MTP speculative-decoding table, and the EP+DP-attention comparison are all GLM-5.2-FP8
+on this hardware. Re-measure with `bench_stream.py` before quoting any of them for
+another model.
+
+## Cutover from the Dynamo stack
+
+One-time, run by hand. The Dynamo stack keeps serving until you run this.
+
+By this point `dynamo/` no longer exists — the rename has landed — so the old stack
+cannot be torn down by its own `stop.sh`. Reach it by project name instead:
+`docker compose -p dynamo ps` resolves a running project from container labels with
+no compose file present (`config` does not, but `ps` and `down` do).
+
+```bash
+# 1. Archive the old worker's log BEFORE teardown -- docker deletes a
+#    container's log with the container, and that log is the only place
+#    SGLang's watchdog writes its per-rank py-spy dump.
+./sglang/archive_worker_log.sh dynamo-worker-1 /scratch/diag/logs
+
+# 2. Tear down the old stack by project name.
+docker compose -p dynamo down
+
+# 3. One-time: carry the JIT kernel cache across the project rename,
+#    avoiding a ~10-20 min DeepGEMM recompile on first start.
+docker volume create glm52-sglang_jit-cache
+docker run --rm \
+  -v dynamo_dynamo-jit-cache:/from \
+  -v glm52-sglang_jit-cache:/to \
+  alpine sh -c 'cp -a /from/. /to/'
+
+# 4. One-time: retag the existing image so serve.sh does not rebuild it
+#    (the rebuild needs host networking + a pip proxy).
+docker tag glm52-dynamo-sglang:0.5.13post1 glm52-sglang:0.5.13post1
+
+# 5. Start.
+cd sglang && ./serve.sh
+docker compose logs -f worker
+```
+
+Step 4 matters: `serve.sh` builds the image only when it is absent, so the renamed
+default tag would otherwise trigger a full rebuild through the proxy on an
+otherwise-offline host.
+
+Then verify — the third check is the one that must not be skipped, because it is the
+only one that fails silently:
+
+```bash
+curl localhost:8000/v1/models              # returns glm-5.2-fp8
+./bench_stream.py --concurrency 1 --num 4  # reasoning_content streams
+./bench_stream.py --concurrency 1 --num 4  # 2nd run: cached_tokens > 0
+```
+
+Rollback is `git revert` plus one restart. The old image survives under its original
+tag and `dynamo_dynamo-jit-cache` is copied rather than moved, so both are intact.
 
 ## Serving config (mirrors the model card / NVIDIA recipe)
 
@@ -68,7 +196,14 @@ editing the worker `command:` in `docker-compose.yml`.
 - **DSA attention backend auto-selected** — no `--attention-backend`; SGLang picks
   `dsa`/`flashmla_kv` (Hopper + fp8 KV). Verified ~+8% system tok/s at conc 32 vs the
   legacy `nsa` backend we used to force.
-- `--dyn-tool-call-parser glm47`, `--dyn-reasoning-parser glm45` (Dynamo frontend parsers)
+- `--tool-call-parser glm47`, `--reasoning-parser glm45` (native SGLang parsers; these
+  were `--dyn-*` under Dynamo, where the frontend did the parsing). Both are
+  env-overridable (`TOOL_PARSER` / `REASONING_PARSER`) because parser names are
+  per-model-family — see [Serving a different GLM model](#serving-a-different-glm-model)
+- **`--enable-cache-report`** — makes the server populate
+  `usage.prompt_tokens_details.cached_tokens`. Not optional: `bench_stream.py` reads it
+  as a direct count of prefix-cache hits, and without the flag the field is *silently*
+  absent. The Dynamo frontend used to populate it for free.
 - **`--context-length 524288` (512K), served under `PROFILE=cache` with a tiered
   prefix cache.** 1M is the model's max, but a single node can't hold a 1M-token
   KV cache next to the ~94 GB/GPU weights: measured 2026-08-31, the decode pool
@@ -99,8 +234,10 @@ editing the worker `command:` in `docker-compose.yml`.
   halving the KV pool (540k→292k tokens, capping single-request context at ~292K), and
   only pays off at hundreds of concurrent requests — but one node caps at 48 max-running
   (6/rank). It's the right config only on ≥ 2 nodes / very high concurrency.
-- **KV-aware routing** — add `--router-mode kv` to the frontend and a `--kv-events-config`
-  to the worker; only a win with ≥ 2 workers/replicas.
+- **KV-aware routing** — would require reintroducing a router process in front of the
+  worker (this is one of the things Dynamo provided). Moot either way at this scale: it
+  only pays off with ≥ 2 workers/replicas, and one node holds exactly one copy of a
+  756 GB model.
 
 ### Tiered KV cache
 
@@ -294,12 +431,12 @@ the expected speculative-decoding profile.
 
 ### Known issues
 
-- **`./stop.sh` intermittently fails to kill `dynamo-worker-1`** with
+- **`./stop.sh` intermittently fails to kill the worker container** with
   `PID ... is zombie and can not be killed. Use the --init option when
   creating containers to run an init inside the container that forwards
   signals and reaps processes.` This hit every restart performed during the
   KV-cache-tiering measurement pass (2026-08-31). Workaround: run
-  `docker kill dynamo-worker-1` first (exits cleanly within a few seconds),
+  `docker kill glm52-sglang-worker-1` first (exits cleanly within a few seconds),
   then `./stop.sh` completes its teardown normally. Not investigated further
   (root cause is presumably the container missing an init/reaper process);
   cosmetic in that teardown still succeeds once you clear the zombie.
@@ -446,7 +583,7 @@ the expected speculative-decoding profile.
   To pull stacks from a wedged worker by hand, without waiting for the watchdog:
 
   ```bash
-  docker exec dynamo-worker-1 bash -c \
+  docker exec glm52-sglang-worker-1 bash -c \
     'for p in $(pgrep -f sglang::scheduler); do echo "== $p"; py-spy dump --pid $p; done'
   ```
 
@@ -454,7 +591,7 @@ the expected speculative-decoding profile.
   change — rebuild it, or patch the live container (does not survive recreation):
 
   ```bash
-  docker exec -u 0:0 dynamo-worker-1 python3 -c \
+  docker exec -u 0:0 glm52-sglang-worker-1 python3 -c \
     "import os; os.setxattr('/usr/local/bin/py-spy', b'security.capability', \
      bytes.fromhex('0100000200000800000000000000000000000000'))"
   ```
@@ -463,13 +600,14 @@ the expected speculative-decoding profile.
 
 - **Behind a proxy:** the Docker bridge can't reach PyPI; the build needs
   `--network=host` + `--build-arg HTTP(S)_PROXY` (handled by `serve.sh`).
-- **Frontend needs the HF cache:** on discovery the frontend loads the model
-  config/tokenizer (not weights) and will otherwise try huggingface.co and fail —
-  the compose mounts the HF cache + sets `HF_HUB_OFFLINE=1` for the frontend too.
+- **Worker needs the HF cache:** it loads the model config/tokenizer and weights and
+  will otherwise try huggingface.co and fail — the compose mounts the HF cache and sets
+  `HF_HUB_OFFLINE=1`.
 - **First start is slow:** SGLang runs a DeepGEMM JIT pre-compile (~10–20 min) +
   CUDA-graph capture. During this phase GPU0 drives compilation (oscillates 0↔100%)
   while GPUs 1–7 spin-wait at a barrier (100% util but ~126 W). The JIT kernels are
-  persisted to the `dynamo-jit-cache` volume (`/home/dynamo/.cache`), so **only the
+  persisted to the `jit-cache` volume (`/home/dynamo/.cache` — `dynamo` is the image's
+  uid-1000 user, unrelated to the removed orchestration layer), so **only the
   first start pays this cost** — later restarts on the same image/GPU reuse the cache
   and come up fast. (Removing the volume or changing the SGLang/GPU arch invalidates
   it and triggers one more recompile.)
@@ -480,15 +618,15 @@ The worker's tiered KV cache (`--hicache-storage-backend=file`, `KV_SCRATCH_DIR`
 writing to `/scratch/kvcache/glm52`) has **no eviction and no size cap** — SGLang's
 `file` backend just keeps writing one `.bin` per page component forever. Left alone
 it grows without bound until the 28 TB `/scratch` volume fills and the worker starts
-failing writes. `dynamo/kv_reaper.py` (20 tests) enforces a byte budget on
+failing writes. `sglang/kv_reaper.py` (20 tests) enforces a byte budget on
 that directory, deleting the oldest files first until the tree fits.
 
 **Schedule** — a user crontab entry, no sudo required (the invoking user owns
 `/scratch/kvcache`). Crontab entries need an absolute path, so substitute
-your actual checkout location for `/path/to/GLM-5.2-FP8` below:
+your actual checkout location for `/path/to/GLM-SGLANG` below:
 
 ```cron
-*/15 * * * * /path/to/GLM-5.2-FP8/dynamo/kv_reaper.py --root /scratch/kvcache/glm52 --max-bytes 10TB >> /scratch/kvcache/reaper.log 2>&1
+*/15 * * * * /path/to/GLM-SGLANG/sglang/kv_reaper.py --root /scratch/kvcache/glm52 --max-bytes 10TB >> /scratch/kvcache/reaper.log 2>&1
 ```
 
 Install with `crontab -e` (interactive; not automatable). The log is written to

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Benchmark the running OpenAI endpoint (Dynamo on :8000) with NVIDIA's load
+# Benchmark the running OpenAI endpoint (SGLang on :8000) with NVIDIA's load
 # generator. Reports TTFT / ITL / throughput.
 #
 # NOTE: the current runtime image ships neither aiperf nor genai-perf, and
@@ -20,7 +20,7 @@ URL="${1:-http://localhost:8000}"
 CONC="${2:-32}"
 NUM="${3:-200}"
 MODEL="${SERVED_NAME:-glm-5.2-fp8}"
-IMAGE="${DYNAMO_IMAGE:-glm52-dynamo-sglang:0.5.13post1}"
+IMAGE="${SGLANG_IMAGE:-glm52-sglang:0.5.13post1}"
 
 # aiperf (newer) if present in the image, else genai-perf.
 docker run --rm --network host "${IMAGE}" bash -lc "

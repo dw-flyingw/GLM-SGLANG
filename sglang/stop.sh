@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
-# Stop and remove the Dynamo (SGLang) stack. Keeps the etcd data volume.
-# Pass --volumes to also drop the etcd volume.
+# Stop and remove the SGLang stack.
+# Pass --volumes to also drop the JIT kernel cache volume (see the warning below).
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# --volumes used to drop only the etcd data volume, which cost nothing to
+# rebuild. That volume is gone; the JIT kernel cache is now the ONLY volume,
+# so the same flag now throws away every DeepGEMM/FlashInfer/Triton kernel the
+# worker has compiled and buys a ~10-20 min precompile on the next start.
+# Warn, but do not prompt -- this script is called from other scripts.
+for arg in "$@"; do
+  case "${arg}" in
+    --volumes|-v)
+      echo "WARNING: --volumes will delete the JIT kernel cache volume." >&2
+      echo "         The next ./serve.sh will pay a ~10-20 min DeepGEMM precompile." >&2
+      ;;
+  esac
+done
 # `--profile "*"` (verified working: `docker compose --profile "*" config --services`
 # lists all profile-gated services) reaches ANY worker profile, present or future,
 # so a new profile added later can't escape teardown and orphan a worker holding
@@ -33,4 +47,4 @@ for svc in worker worker-longctx; do
 done
 
 docker compose "${PROFILE_ARGS[@]}" down "$@"
-echo "Dynamo stack stopped."
+echo "SGLang stack stopped."

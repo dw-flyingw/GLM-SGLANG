@@ -21,7 +21,7 @@ reach the model's full 1,048,576-token context on this same single node via
 SGLang's HiSparse attention path (`--enable-hisparse --disable-radix-cache`,
 `--context-length=1048576`). As of 2026-09-01 it **does start at 1M** — but it
 **crashes on the first request it is given**, so it is still unusable. Six
-attempts, `dynamo/RESULTS-kv-tiering.md`:
+attempts, `sglang/RESULTS-kv-tiering.md`:
 
 - **Attempt 1** (`--mem-fraction-static=0.88`, the documented default for this
   profile): worker died during CUDA-graph capture —
@@ -79,7 +79,7 @@ it.
 
 **Reducing `--context-length` is not a lever.** Measured 2026-09-01 by
 attempt 4; this supersedes the diagnosis previously recorded here (and in
-`dynamo/README.md` and `dynamo/docker-compose.yml`), which claimed a smaller
+`sglang/README.md` and `sglang/docker-compose.yml`), which claimed a smaller
 `--context-length` for Profile B was the promising untried lever. It is not.
 `--mem-fraction-static` fixes the static budget (weights + KV pool), and
 SGLang sizes the KV pool to fill whatever remains of that budget once the
@@ -124,9 +124,9 @@ measurement.
 | Served context (`--context-length`) | 524,288 (512K) | 1,048,576 (1M, configured) |
 | KV pool (measured, `max_total_num_tokens`) | **540,928** tokens | **460,352** tokens at `mem-fraction 0.82` (attempt 6) — *smaller* than Profile A; the rest pages to ~377 GB of host memory (47.11 GB/rank) |
 | Attention | DSA, `flashmla_kv`, hierarchical radix cache (GPU→host→`/scratch`) | DSA, `flashmla_kv`, HiSparse (`--disable-radix-cache`, no prefix caching) |
-| Backend | Dynamo + SGLang 0.5.13.post1 | Dynamo + SGLang 0.5.13.post1 |
+| Backend | SGLang 0.5.13.post1 | SGLang 0.5.13.post1 |
 | Speculative decoding | MTP/EAGLE on | **removed** — crashes with HiSparse (attempt 5); Profile B forgoes MTP's ~2× single-stream decode |
-| Status | serving, measured (see `dynamo/RESULTS-kv-tiering.md`) | **starts at 1M, cannot serve** — crashes on first request (SGLang HiSparse decode bug). Attempts 1–4 OOM; 5 MTP crash; 6 decode crash |
+| Status | serving, measured (see `sglang/RESULTS-kv-tiering.md`) | **starts at 1M, cannot serve** — crashes on first request (SGLang HiSparse decode bug). Attempts 1–4 OOM; 5 MTP crash; 6 decode crash |
 
-References: `README.md`, `dynamo/README.md`, `dynamo/RESULTS-kv-tiering.md`,
-`dynamo/docker-compose.yml`.
+References: `README.md`, `sglang/README.md`, `sglang/RESULTS-kv-tiering.md`,
+`sglang/docker-compose.yml`.

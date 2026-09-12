@@ -3,8 +3,13 @@
 | Model | Profile | Served context | Status |
 |---|---|---|---|
 | **GLM-5.3-Flash** | `flash` | **1,048,576 (1M)** | **serving, verified 2026-09-12** |
-| GLM-5.2-FP8 | `cache` | 524,288 (512K) | serving |
+| GLM-5.2-FP8 | `cache` | 524,288 (512K) | retired 2026-09-12, rollback only |
 | GLM-5.2-FP8 | `longctx` | 1,048,576 (configured) | never served a request |
+
+GLM-5.2 was retired on 2026-09-12 once GLM-5.3-Flash was verified. Its weights are
+kept on disk as a rollback path; its 8.7 TB `/scratch/kvcache/glm52` KV tier was
+deleted, and the reaper cron for it removed. Rolling back therefore starts with a
+cold cache.
 
 ## GLM-5.3-Flash serves the full 1M (2026-09-12)
 

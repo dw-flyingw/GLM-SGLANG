@@ -97,13 +97,16 @@ def test_project_name_is_pinned(_docker_available):
 
 def test_wildcard_profile_reaches_every_worker(_docker_available):
     """stop.sh tears down with --profile "*" so a worker can never be
-    orphaned holding 8 GPUs. That must reach both workers and nothing else."""
+    orphaned holding 8 GPUs. That must reach EVERY worker and nothing else --
+    add any new worker service here, or stop.sh will silently leave it
+    running on all 8 GPUs."""
     result = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE), "--profile", "*",
          "config", "--services"],
         capture_output=True, text=True, check=True,
     )
-    assert sorted(result.stdout.split()) == ["worker", "worker-longctx"]
+    assert sorted(result.stdout.split()) == [
+        "worker", "worker-flash", "worker-longctx"]
 
 
 def test_engine_tunables_are_unchanged(_docker_available):

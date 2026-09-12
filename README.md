@@ -3,13 +3,32 @@
 An SGLang serving stack for GLM-family models on a single 8× H200 node, exposing an
 OpenAI-compatible API on `:8000`.
 
-**Currently configured for and measured against
-[`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8).** The served model is
-the `MODEL` env var, but swapping it is not just a variable change — the context length,
-memory fraction, page size, parsers, and speculative-decoding setup are all tuned to this
-model, and every benchmark in this repo was measured on it. See
-[Serving a different GLM model](sglang/README.md#serving-a-different-glm-model) for what
-has to be re-checked.
+**Currently serving [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash)
+(`PROFILE=flash`), at the full 1M context.** GLM-5.2-FP8 is retained as a rollback path
+but is no longer run.
+
+```bash
+cd sglang && PROFILE=flash ./serve.sh
+```
+
+| Profile | Model | Context | Status |
+|---|---|---|---|
+| **`flash`** | **GLM-5.3-Flash** | **1,048,576 (1M)** | **primary** — verified 2026-09-12 |
+| `cache` | GLM-5.2-FP8 | 524,288 (512K) | retained for rollback, not running |
+| `longctx` | GLM-5.2-FP8 | 1M configured | never served a request |
+
+The two GLM-5.2 profiles still work and their measurements
+([`sglang/RESULTS-kv-tiering.md`](sglang/RESULTS-kv-tiering.md)) remain valid, but they
+describe a model this node no longer serves. GLM-5.2's weights are kept on disk; its
+`/scratch` KV cache was deleted on 2026-09-12 when it was retired.
+
+**The two models are not interchangeable.** GLM-5.3-Flash is `Glm5Next` — 45 layers of
+hybrid attention (34 KDA linear + 11 DSA), 288 routed experts, natively multimodal,
+~306 GB — against GLM-5.2's 78 all-DSA layers and ~756 GB. Almost no tuning carries
+over, and the wrong `--kv-cache-dtype` is invalid rather than merely slow on Hopper.
+It also needs a **different engine image**: `glm5_next` is in no public SGLang release.
+See [`sglang/README.md`](sglang/README.md) and
+[`CONTEXT_WINDOW.md`](CONTEXT_WINDOW.md).
 
 > This repo has served the model two ways before: a plain vLLM container, and then
 > NVIDIA Dynamo with the SGLang backend. vLLM was dropped because no Dynamo runtime

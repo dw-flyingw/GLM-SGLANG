@@ -11,3 +11,7 @@ wheels/
 
 # Local compose env (not committed; e.g. HF_CACHE on the serving host)
 sglang/.env
+
+# Transient compose overrides written by sweep_glm53.py / ab_hicache.py
+sglang/.sweep-override.yml
+sglang/.ab-override.yml

@@ -191,6 +191,14 @@ services:
       # populated it for free. Drop this flag and there is no error: the field
       # just disappears and cache effectiveness has to be guessed from TTFT.
       - --enable-cache-report
+      # Prometheus metrics on /metrics. NOT optional for observability: under
+      # Dynamo the FRONTEND exposed dynamo_frontend_inflight_requests, TTFT/ITL
+      # histograms and request counters, and that frontend is gone. Without this
+      # flag sglang.launch_server serves no /metrics at all (it 404s), and the
+      # only way to see inflight requests or latency is grepping worker logs.
+      # Verified missing after the 2026-09-11 cutover; the runbook's three
+      # checks do not cover it.
+      - --enable-metrics
       # MTP speculative decoding: GLM-5.2 ships 1 MTP layer; EAGLE drives it from the
       # main checkpoint (no separate draft model). topk=1 => a draft chain, so
       # num-draft-tokens == num-steps + 1. Verified to compose with the auto-selected
@@ -327,6 +335,8 @@ services:
       # populated it for free. Drop this flag and there is no error: the field
       # just disappears and cache effectiveness has to be guessed from TTFT.
       - --enable-cache-report
+      # See the worker service: without this /metrics 404s entirely.
+      - --enable-metrics
       # HiSparse selects flashmla_kv itself for fp8_e4m3 KV -- the same backend
       # the aggregated worker auto-selects. Do NOT add --attention-backend.
       - --enable-hisparse
@@ -389,6 +399,176 @@ services:
       # THE COST: Profile B gives up the ~2x single-stream decode that MTP
       # provides under Profile A. Full detail: RESULTS-kv-tiering.md, section
       # "Profile B attempt 5/6".
+
+
+  # Profile C: GLM-5.3-Flash. A DIFFERENT MODEL AND A DIFFERENT IMAGE -- this
+  # is not a variant of the worker above and shares none of its tuning.
+  #
+  # GLM-5.3-Flash is Glm5NextForCausalLM/-ForConditionalGeneration
+  # (model_type glm5_next), NOT GlmMoeDsaForCausalLM: 320B total / 18B active,
+  # 45 text layers of HYBRID attention -- 34 KDA (linear) + 11 DSA (full), a
+  # 3:1 repeat -- 288 routed experts (8/tok), a native MTP layer, a 24-layer
+  # vision encoder, and 1M context. ~306 GiB of weights vs GLM-5.2's ~756 GB.
+  #
+  # ENGINE: requires an SGLang build carrying glm5_next, which landed on main
+  # 2026-09-06 (PR #36507) -- ONE DAY AFTER the v0.5.19 release. It is in NO
+  # public SGLang release, so `pip install sglang==<any released version>`
+  # cannot serve this model and our glm52 image (0.5.13.post1) has no
+  # Glm5Next class at all. Upstream ships a purpose-built CUDA 13 image and
+  # says the nightlies do not work either. Hence the hardcoded image below.
+  #
+  # Flags follow upstream's VERIFIED 8xH200 TP8/EP8 cell, cookbook
+  # docs/cookbook/autoregressive/GLM/GLM-5.3-Flash.mdx (config snippet
+  # docs/src/snippets/configs/zai-org/glm-5.3-flash.jsx). Support is days old
+  # with an active bug tracker (sgl-project/sglang#37524) -- re-check it
+  # before trusting any of this in production.
+  worker-flash:
+    <<: *worker-base
+    profiles: ["flash"]
+    # NOT ${SGLANG_IMAGE}: that defaults to the GLM-5.2 image, which cannot
+    # load this architecture. Overridable, but the override must also carry
+    # glm5_next.
+    image: ${SGLANG_FLASH_IMAGE:-lmsysorg/sglang:glm-5.3-flash}
+    environment:
+      <<: *coredump-env
+      HF_HOME: "${HF_CACHE:-/root/.cache/huggingface}"
+      HF_HUB_OFFLINE: "1"
+      # L3 tier target. Its own directory, NOT glm52's: hicache storage keys
+      # carry no model identity, so pointing two different models at one
+      # directory would let them collide on the same cache keys.
+      # HiCacheFile defaults to /tmp/hicache (the root filesystem) if unset --
+      # setting it is not optional. serve.sh probes it before start.
+      SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR: "${KV_SCRATCH_DIR:-/scratch/kvcache/glm53}"
+    volumes:
+      - "${HF_CACHE:-/root/.cache/huggingface}:${HF_CACHE:-/root/.cache/huggingface}"
+      - "jit-cache:/home/dynamo/.cache"
+      # L3 KV tier. Separate NVMe from /data (the weight cache) so cache I/O
+      # does not contend with weight loading.
+      - "${KV_SCRATCH_ROOT:-/scratch/kvcache}:${KV_SCRATCH_ROOT:-/scratch/kvcache}"
+      # Crash dumps: this model is new enough that a hang is worth capturing.
+      - "${DIAG_DIR:-/scratch/diag}:${DIAG_DIR:-/scratch/diag}"
+    command:
+      - --model-path=${FLASH_MODEL:-zai-org/GLM-5.3-Flash}
+      - --served-model-name=${FLASH_SERVED_NAME:-glm-5.3-flash}
+      - --host=${HTTP_HOST:-127.0.0.1}
+      - --port=${PORT:-8000}
+      - --tp-size=${TP_SIZE:-8}
+      # EP=8 alongside TP=8: in the verified cell, absent from our GLM-5.2
+      # worker. 288 routed experts make expert parallelism worth having.
+      - --ep-size=${FLASH_EP_SIZE:-8}
+      # ---- KV dtype and DSA backends MUST move together --------------------
+      # bfloat16 + tilelang, NOT the fp8_e4m3 we run for GLM-5.2. On Hopper,
+      # upstream DISABLES fp8 KV: "FP8 KV cache with TRT-LLM DSA is not
+      # supported on Hopper GPUs", and "TileLang DSA with FP8 KV is not a
+      # valid CUDA combination". fp8_e4m3 is a silent-looking carryover that
+      # is actually invalid here. The fp8+trtllm pairing is Blackwell-only.
+      - --kv-cache-dtype=bfloat16
+      - --dsa-prefill-backend=tilelang
+      - --dsa-decode-backend=tilelang
+      # Unlike the GLM-5.2 worker we do NOT rely on auto-selection: the
+      # verified cell names both backends explicitly.
+      - --moe-runner-backend=deep_gemm
+      - --mem-fraction-static=${FLASH_MEM_FRACTION:-0.75}
+      # ---- The knob that actually governs concurrency ----------------------
+      # This model keeps TWO pools: the paged KV pool AND a separate KDA
+      # (linear-attention) state pool. Upstream: "The KDA state pool can limit
+      # concurrency before the KV pool is full. If startup reduces
+      # max_running_requests because of KDA state capacity, increase
+      # --mamba-full-memory-ratio or set --max-mamba-cache-size."
+      # 0.9 is the engine default and explicitly "a generic starting point
+      # rather than a workload-tuned split" -- too low starves the KDA pool
+      # and clamps max_running_requests, too high shrinks the KV pool. Tune it
+      # from the two pool sizes the worker prints in ONE boot log. This has no
+      # analogue in the GLM-5.2 profiles; it is the first thing to measure.
+      - --mamba-full-memory-ratio=${MAMBA_RATIO:-0.9}
+      # MEASURED 2026-09-12 (RESULTS-glm53-sweep.md). The engine default is
+      # None, which resolves to float32 -- an explicit --mamba-ssm-dtype
+      # float32 run produced byte-identical pool sizes, confirming it. Half
+      # precision on the KDA recurrent state nearly DOUBLES how many sequences
+      # the state pool holds, at the same memory, and leaves room for a bigger
+      # KV pool:
+      #     float32 (default): max_mamba_cache_size  798, max_total_num_tokens 3,500,608
+      #     bfloat16         : max_mamba_cache_size 1548, max_total_num_tokens 3,687,104
+      # These are boot-log pool allocations, not throughput, so unlike the rest
+      # of that sweep they are not subject to its ~24% run-to-run noise.
+      # GSM8K on bfloat16 was verified before adopting -- see the sweep doc.
+      - --mamba-ssm-dtype=${MAMBA_SSM_DTYPE:-bfloat16}
+      # ---- Parsers ---------------------------------------------------------
+      # Same values as GLM-5.2 today. Upstream has an open issue to add a
+      # dedicated glm53 tool-call detector (sgl-project/sglang#37925); revisit
+      # TOOL_PARSER when that lands.
+      - --tool-call-parser=${TOOL_PARSER:-glm47}
+      - --reasoning-parser=${REASONING_PARSER:-glm45}
+      # Not in the upstream cell, kept from our stack: without it
+      # usage.prompt_tokens_details.cached_tokens silently disappears and
+      # bench_stream.py loses its direct prefix-cache-hit count.
+      - --enable-cache-report
+      # See the worker service: without this /metrics 404s entirely.
+      - --enable-metrics
+      # ---- Speculative decoding (Strategy: Low Latency) --------------------
+      # Adaptive MTP 5/1/6 -- deeper than GLM-5.2's 2/1/3, plus the adaptive
+      # flag, which the verified low-latency cell carries. For the High
+      # Throughput operating point, DELETE all five flags (spec decode off);
+      # under sustained batches the draft-and-verify overhead can cost more
+      # than it returns. Measure both before choosing.
+      # NOTE: adaptive MTP is incompatible with DP-attention -- the server
+      # falls back to a static draft depth and warns. Do not add --dp-size.
+      - --speculative-algorithm=${SPEC_ALGO:-EAGLE}
+      - --speculative-num-steps=${FLASH_SPEC_NUM_STEPS:-5}
+      - --speculative-eagle-topk=${FLASH_SPEC_EAGLE_TOPK:-1}
+      - --speculative-num-draft-tokens=${FLASH_SPEC_NUM_DRAFT:-6}
+      - --speculative-adaptive
+      # ---- Tiered KV cache (GPU radix -> host RAM L2 -> /scratch L3) -------
+      # NOTE: upstream's verified cell has HiCache OFF and says "Keep HiCache
+      # off when GPU memory is sufficient". Measured on this box at boot,
+      # max_total_num_tokens = 3,500,608 -- 6.5x GLM-5.2's 540,928, because
+      # only 11 of 45 layers hold a paged KV cache (the other 34 are KDA
+      # linear-attention state). So GPU memory IS sufficient by upstream's
+      # standard and these flags are an explicit local choice, NOT the
+      # upstream recommendation. Upstream marks every HiCache option
+      # "Not Verified" for this model (see sgl-project/sglang#38474).
+      # MEASURE against the no-hicache baseline before keeping this.
+      #
+      # --hicache-size is PER TP RANK: 32 GB/rank => ~256 GB of host pool at
+      # TP=8. Upstream suggests 32 and warns the default ratio "can demand
+      # more host RAM than the node has free". GLM-5.2 used 96/rank (~770 GB);
+      # do not copy that number here without checking free host RAM first.
+      - --enable-hierarchical-cache
+      - --hicache-size=${HICACHE_GB:-32}
+      # write_through writes EVERY page to host and /scratch synchronously.
+      # Measured on GLM-5.2: ~8.7% system throughput cost at concurrency 32.
+      # write_through_selective writes only hotter pages. Override to A/B.
+      # write_through_selective, NOT write_through. Measured 2026-09-12: plain
+      # write_through collapsed concurrency-1 throughput to 109 tok/s vs
+      # 207-247 for every other config, with ITL p99 98.7 ms vs ~13 ms -- the
+      # signature of synchronous per-page writes stalling decode. That gap was
+      # the ONLY throughput difference in the sweep large enough to clear its
+      # ~24% noise floor. Do not revert to write_through without re-measuring.
+      - --hicache-write-policy=${HICACHE_WRITE_POLICY:-write_through_selective}
+      # `kernel` I/O is downgraded to `direct` only when the effective DECODE
+      # backend is fa3; ours is tilelang. VERIFIED 2026-09-12: no downgrade in
+      # any of the 5 sweep runs (io_backend_downgraded False throughout).
+      - --hicache-io-backend=kernel
+      - --hicache-mem-layout=page_first
+      # `file`, not `mooncake`: upstream lists mooncake as the L3 option, but
+      # that is a multi-NODE KV store (see docs/Mooncake.md). On one node it
+      # adds a service and buys nothing over a local directory.
+      - --hicache-storage-backend=file
+      - --hicache-storage-prefetch-policy=timeout
+      # ---- Deliberately NOT set --------------------------------------------
+      # Prefix caching stays ON (it is not hicache); upstream: "Keep the
+      #   prefix cache enabled for every strategy."
+      # --context-length: the verified cell does not pin it; the model is 1M
+      #   native. Set MAX_MODEL_LEN-style only after the boot log shows what
+      #   the two pools actually allow.
+      # --page-size: GLM-5.2 needs 64 for its DSA indexer; the 5.3 cell does
+      #   not set it. Leave the engine default until measured.
+      # --max-running-requests: tune AFTER --mamba-full-memory-ratio, since
+      #   the KDA pool is what clamps it.
+      # --json-model-override-args: do NOT override linear_lower_bound.
+      #   Upstream: "Keep the checkpoint's KDA lower-bound setting unchanged."
+      # --dcp-size: DCP is validated only on 4x GB300 for now.
+      # --trust-remote-code: glm5_next is natively supported; the cell omits it.
 
 volumes:
   jit-cache:   # persisted JIT kernel cache (fast worker restarts)

@@ -16,13 +16,27 @@ IMAGE="${SGLANG_IMAGE:-glm52-sglang:0.5.13post1}"
 
 PROFILE="${PROFILE:-cache}"
 case "${PROFILE}" in
-  cache|longctx) ;;
-  *) echo "Unknown PROFILE '${PROFILE}' (expected: cache, longctx)" >&2; exit 1 ;;
+  cache|longctx|flash) ;;
+  *) echo "Unknown PROFILE '${PROFILE}' (expected: cache, longctx, flash)" >&2; exit 1 ;;
 esac
 
-if [ "${PROFILE}" = "cache" ]; then
+# PROFILE=flash serves a DIFFERENT MODEL (GLM-5.3-Flash) on a DIFFERENT IMAGE.
+# glm5_next is in no public SGLang release, so the image is PULLED from
+# upstream, never built from our Dockerfile -- see the build guard below.
+if [ "${PROFILE}" = "flash" ]; then
+  IMAGE="${SGLANG_FLASH_IMAGE:-lmsysorg/sglang:glm-5.3-flash}"
+fi
+
+# PROFILE=flash also runs a file-backed L3 tier, in its OWN directory: the
+# storage keys carry no model identity, so sharing one directory between two
+# different models would let 5.2 and 5.3 collide on the same cache keys.
+if [ "${PROFILE}" = "cache" ] || [ "${PROFILE}" = "flash" ]; then
   KV_SCRATCH_ROOT="${KV_SCRATCH_ROOT:-/scratch/kvcache}"
-  KV_SCRATCH_DIR="${KV_SCRATCH_DIR:-/scratch/kvcache/glm52}"
+  if [ "${PROFILE}" = "flash" ]; then
+    KV_SCRATCH_DIR="${KV_SCRATCH_DIR:-/scratch/kvcache/glm53}"
+  else
+    KV_SCRATCH_DIR="${KV_SCRATCH_DIR:-/scratch/kvcache/glm52}"
+  fi
 
   # Normalize both paths before the prefix check below. realpath -m collapses
   # '..' traversal and does not require the path to exist, so
@@ -101,6 +115,21 @@ export DIAG_DIR
 
 # Build the custom SGLang-0.5.13.post1 image if it's not present. --network=host is
 # required: Docker's default bridge network can't reach pypi.org behind a proxy.
+if ! docker image inspect "${IMAGE}" >/dev/null 2>&1 && [ "${PROFILE}" = "flash" ]; then
+  cat >&2 <<EOF
+Image ${IMAGE} not found, and PROFILE=flash must NOT build it.
+
+GLM-5.3-Flash needs an SGLang build carrying glm5_next, which landed on main
+2026-09-06 -- after the v0.5.19 release. There is no released sglang that can
+serve it, so our Dockerfile (pip install sglang==0.5.13.post1) cannot produce
+a working image. Pull upstream's purpose-built image instead:
+
+  docker pull ${IMAGE}
+
+EOF
+  exit 1
+fi
+
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   echo "Image ${IMAGE} not found; building (needs host networking + proxy for pip) ..."
   docker build --network=host \
@@ -157,13 +186,13 @@ fi
 # will: run a throwaway container as the same uid:gid and try a real write.
 # This runs after the image build above (it needs the image present) but
 # before `docker compose up`, and a probe failure must NOT trigger a build.
-if [ "${PROFILE}" = "cache" ]; then
+if [ "${PROFILE}" = "cache" ] || [ "${PROFILE}" = "flash" ]; then
   if ! docker run --rm -u 1000:0 \
        -v "${KV_SCRATCH_ROOT}:${KV_SCRATCH_ROOT}" \
        "${IMAGE}" bash -c "touch '${KV_SCRATCH_DIR}/.probe' && rm -f '${KV_SCRATCH_DIR}/.probe'" \
        >/dev/null 2>&1; then
     cat >&2 <<EOF
-PROFILE=cache needs ${KV_SCRATCH_DIR} writable by the CONTAINER's user
+PROFILE=${PROFILE} needs ${KV_SCRATCH_DIR} writable by the CONTAINER's user
 (uid=1000 gid=0, the image's dynamo user), not just the host user running
 this script. A container write probe to that directory failed.
 
@@ -185,6 +214,8 @@ fi
 
 if [ "${PROFILE}" = "longctx" ]; then
   WORKER_SERVICE="worker-longctx"
+elif [ "${PROFILE}" = "flash" ]; then
+  WORKER_SERVICE="worker-flash"
 else
   WORKER_SERVICE="worker"
 fi

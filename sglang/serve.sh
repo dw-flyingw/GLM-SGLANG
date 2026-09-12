@@ -19,7 +19,11 @@ cd "$(dirname "$0")"
 
 IMAGE="${SGLANG_IMAGE:-glm52-sglang:0.5.13post1}"
 
-PROFILE="${PROFILE:-cache}"
+# Default is flash: GLM-5.3-Flash is the served model and GLM-5.2 is retired
+# (rollback only). This was `cache` until 2026-09-12, which meant a bare
+# ./serve.sh -- or any restart script that forgot PROFILE -- silently booted
+# the retired model onto all 8 GPUs.
+PROFILE="${PROFILE:-flash}"
 case "${PROFILE}" in
   cache|longctx|flash) ;;
   *) echo "Unknown PROFILE '${PROFILE}' (expected: cache, longctx, flash)" >&2; exit 1 ;;
@@ -70,7 +74,7 @@ if [ "${PROFILE}" = "cache" ] || [ "${PROFILE}" = "flash" ]; then
   # without spawning a container.
   if [ ! -d "${KV_SCRATCH_DIR}" ]; then
     cat >&2 <<EOF
-PROFILE=cache needs a KV cache directory at ${KV_SCRATCH_DIR}
+PROFILE=${PROFILE} needs a KV cache directory at ${KV_SCRATCH_DIR}
 
   sudo mkdir -p ${KV_SCRATCH_DIR}
   sudo chown -R 1000:\$(id -g) ${KV_SCRATCH_ROOT}

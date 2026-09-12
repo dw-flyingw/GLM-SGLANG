@@ -13,14 +13,23 @@ measurement behind the entire KV-tiering result. This test is the
 commit-time net for that.
 """
 import pathlib
+import re
 import shutil
 import subprocess
 
 import pytest
 
 COMPOSE = pathlib.Path(__file__).resolve().parents[1] / "sglang" / "docker-compose.yml"
+SERVE = COMPOSE.parent / "serve.sh"
 
-WORKER_PROFILES = [("cache", "worker"), ("longctx", "worker-longctx")]
+# Every worker profile. worker-flash was missing from this list from the day it was
+# added, so the parametrized checks below -- including the cache-report one this
+# file calls the important one -- never covered the model actually being served.
+WORKER_PROFILES = [
+    ("cache", "worker"),
+    ("longctx", "worker-longctx"),
+    ("flash", "worker-flash"),
+]
 
 
 @pytest.fixture(scope="session")
@@ -160,3 +169,13 @@ def test_scripts_are_syntactically_valid(script):
     path = COMPOSE.parent / script
     result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_serve_defaults_to_flash_profile():
+    """A bare ./serve.sh -- or any restart script that forgets PROFILE -- boots
+    whatever this default names onto all 8 GPUs. It was `cache` until
+    2026-09-12, which after GLM-5.2 was retired meant silently starting the
+    retired model. Static check: needs no docker."""
+    m = re.search(r'^PROFILE="\$\{PROFILE:-(\w+)\}"$', SERVE.read_text(), re.M)
+    assert m, "could not find the PROFILE default line in serve.sh"
+    assert m.group(1) == "flash"

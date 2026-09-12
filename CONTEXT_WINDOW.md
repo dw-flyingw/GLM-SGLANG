@@ -48,8 +48,8 @@ Retained as the record of why 1M was unreachable for **that** model on this
 hardware. It remains accurate for `PROFILE=cache` and `PROFILE=longctx`.
 
 The GLM-5.2-FP8 model supports a **1M token** max context natively, but that
-deployment serves **512K** (`--context-length 524288`) as its default profile
-(`PROFILE=cache`).
+deployment serves **512K** (`--context-length 524288`) under `PROFILE=cache`,
+which was the repo's default profile until 2026-09-12.
 
 ## Why not 1M on a single node (GLM-5.2)
 
@@ -167,7 +167,7 @@ measurement.
 
 (GLM-5.2 profiles only; for GLM-5.3-Flash see the top of this document.)
 
-| Setting | Profile A (`cache`, default) | Profile B (`longctx`) |
+| Setting | Profile A (`cache`; default until 2026-09-12) | Profile B (`longctx`) |
 |---|---|---|
 | Model max context | 1,048,576 (1M) | 1,048,576 (1M) |
 | Served context (`--context-length`) | 524,288 (512K) | 1,048,576 (1M, configured) |

@@ -241,7 +241,7 @@ tag and `dynamo_dynamo-jit-cache` is copied rather than moved, so both are intac
 
 ### Tiered KV cache
 
-`PROFILE=cache` (the default) adds a hierarchical prefix cache below the GPU
+`PROFILE=cache` (the default until 2026-09-12, when GLM-5.3-Flash replaced it) adds a hierarchical prefix cache below the GPU
 radix cache: GPU pool → host RAM (L2) → `/scratch` NVMe (L3). All figures
 below are measured 2026-08-31 against this deployment (image tag
 `glm52-dynamo-sglang:0.5.13post1`), recorded in full in

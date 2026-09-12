@@ -38,7 +38,7 @@ See [`sglang/README.md`](sglang/README.md) and
 > a single node holding one ~756 GB model. The engine has been SGLang throughout, and
 > no engine flag changed when Dynamo was removed. See `sglang/README.md`.
 
-## Model
+## Model (GLM-5.2-FP8, retained for rollback)
 
 - Architecture: `GlmMoeDsaForCausalLM` — MoE (256 routed + 1 shared experts, 8/tok),
   MLA attention, **DeepSeek-style Sparse Attention (DSA)** with an indexer
@@ -48,12 +48,15 @@ See [`sglang/README.md`](sglang/README.md) and
 
 ## Serve
 
-`PROFILE=cache` is the default and only serving profile that has been measured
-working on this hardware. `/scratch` must exist and be writable **by the
-container's uid 1000, not just the host user** before the first start:
+`PROFILE=flash` (GLM-5.3-Flash) is the default; `PROFILE=cache` (GLM-5.2-FP8) is
+kept for rollback. Both use a file-backed L3 KV tier on `/scratch`, each in its own
+directory (`glm53` and `glm52` -- storage keys carry no model identity, so they must
+not share one). It must exist and be writable **by uid 1000, not just the host
+user** before the first start (`serve.sh` probes as uid 1000; the GLM-5.3-Flash
+image itself runs as root):
 
 ```bash
-sudo mkdir -p /scratch/kvcache/glm52
+sudo mkdir -p /scratch/kvcache/glm53
 sudo chown -R 1000:$(id -g) /scratch/kvcache
 sudo chmod -R 2775 /scratch/kvcache
 ```
@@ -76,18 +79,18 @@ with a dead L3 cache tier and no warning.
 
 ```bash
 cd sglang
-PROFILE=cache ./serve.sh         # default: 512K context + tiered KV cache (GPU->host RAM->/scratch)
-# PROFILE=longctx ./serve.sh     # attempts the model's full 1M context via HiSparse instead;
-#                                 # does NOT currently start on this hardware (CUDA OOM during
-#                                 # CUDA-graph capture in every attempt) -- see CONTEXT_WINDOW.md
-docker compose logs -f worker    # watch startup (first boot is slow; see below)
-./stop.sh                        # stop + remove the stack
+./serve.sh                           # default PROFILE=flash: GLM-5.3-Flash, 1M context, tiered KV cache
+# PROFILE=cache ./serve.sh           # GLM-5.2-FP8 rollback: 512K context + tiered KV cache
+# PROFILE=longctx ./serve.sh         # GLM-5.2-FP8 1M attempt via HiSparse: starts, but crashes
+#                                     # on its first request -- see CONTEXT_WINDOW.md
+docker compose logs -f worker-flash  # watch startup (`worker` under PROFILE=cache)
+./stop.sh                            # stop + remove; on GLM-5.2 the first `down` can fail, re-run it
 ```
 
-The stack = one SGLang worker (aggregated, TP=8,
+Under `PROFILE=cache`, the GLM-5.2 stack = one SGLang worker (aggregated, TP=8,
 auto-selected DSA attention backend (`flashmla_kv` on Hopper+fp8), fp8 KV cache,
-**MTP/EAGLE speculative decoding on** — ~2× single-stream decode). Under the
-default `PROFILE=cache`, context is served at **512K** (`--context-length
+**MTP/EAGLE speculative decoding on** — ~2× single-stream decode), with context
+served at **512K** (`--context-length
 524288`) with a tiered prefix cache (GPU radix → host RAM → `/scratch`
 NVMe) so that evicted prefixes can still be served from cache instead of
 recomputed. That protection is not free: measured conc-32 system throughput

@@ -527,7 +527,19 @@ services:
       # standard and these flags are an explicit local choice, NOT the
       # upstream recommendation. Upstream marks every HiCache option
       # "Not Verified" for this model (see sgl-project/sglang#38474).
-      # MEASURE against the no-hicache baseline before keeping this.
+      #
+      # DO NOT turn this off on the strength of RESULTS-glm53-hicache-ab.md.
+      # That A/B shows HiCache costing ~38% of sustained throughput, but it
+      # drives ONE 2000-token shared prefix, which the 3.5M-token GPU radix
+      # cache absorbs entirely (97.8% hit) -- so the host/disk tiers take
+      # every write and serve no recall the GPU tier would not have served.
+      # It measures HiCache's cost in the one case where it has no upside.
+      # This deployment runs long agentic loops (tool-using agents, judging
+      # loops, LangChain deep agents) whose real prompts are ~100K+ tokens
+      # -- measured mean TTFT 16.6 s over 35,551 production requests, vs
+      # 130-180 ms for the benchmark's 2K prompts. At that context size 64
+      # concurrent requests DO overflow the GPU pool, which is the case the
+      # tiers exist for. See docs/hicache-workload-fit.md.
       #
       # --hicache-size is PER TP RANK: 32 GB/rank => ~256 GB of host pool at
       # TP=8. Upstream suggests 32 and warns the default ratio "can demand

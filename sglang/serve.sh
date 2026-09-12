@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 #
-# Serve GLM-5.2-FP8 via SGLang on 8x H200, aggregated TP=8.
+# Serve a GLM model via SGLang on 8x H200, aggregated TP=8.
+#   PROFILE=flash    GLM-5.3-Flash  (primary; upstream image, pulled not built)
+#   PROFILE=cache    GLM-5.2-FP8    (retained for rollback)
+#   PROFILE=longctx  GLM-5.2-FP8    (1M attempt; starts but cannot serve)
 # Brings up one SGLang worker (full model, all GPUs), serving the OpenAI API itself.
 #
 # Serves on host port 8000 (OpenAI-compatible). Set PORT= to change.
 #
 # Tunables (env): PORT, MAX_MODEL_LEN, MEM_FRACTION, TP_SIZE, PAGE_SIZE,
 #   HF_CACHE, MODEL, SERVED_NAME, SGLANG_IMAGE, PROFILE, KV_SCRATCH_ROOT,
-#   KV_SCRATCH_DIR, HICACHE_GB.  See docker-compose.yml.
+#   KV_SCRATCH_DIR, HICACHE_GB.  PROFILE=flash also reads SGLANG_FLASH_IMAGE,
+#   FLASH_MODEL, FLASH_SERVED_NAME, MAMBA_RATIO, MAMBA_SSM_DTYPE,
+#   HICACHE_WRITE_POLICY.  See docker-compose.yml.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -151,7 +156,24 @@ fi
 # A warning, not a hard failure, for the usual reason: a broken diagnostics
 # path must never stop the model from serving. But the model DOES serve
 # blind until this is rebuilt.
-if ! docker run --rm "${IMAGE}" \
+#
+# Only meaningful for an image that runs as a NON-root user. The file
+# capability exists because the GLM-5.2 image runs as uid 1000 (dynamo), where
+# cap_add: SYS_PTRACE lands only in the bounding set. An image running as root
+# gets CAP_SYS_PTRACE in its EFFECTIVE set from cap_add directly, so py-spy
+# needs no xattr. That is the GLM-5.3-Flash image (Config.User empty):
+# verified 2026-09-12 that its schedulers run as uid 0 with CAP_SYS_PTRACE
+# effective and that `py-spy dump` attaches and prints a stack. Its py-spy also
+# lives at /opt/sglang/bin, not the /usr/local/bin probed below -- so without
+# this guard the check fired a FALSE warning on every flash start, and its
+# suggested fix (rebuild from our Dockerfile) yields an image that cannot load
+# glm5_next at all.
+IMAGE_USER="$(docker image inspect "${IMAGE}" --format '{{.Config.User}}' 2>/dev/null || true)"
+case "${IMAGE_USER%%:*}" in
+  ""|root|0) IMAGE_RUNS_AS_ROOT=1 ;;
+  *)         IMAGE_RUNS_AS_ROOT=0 ;;
+esac
+if [ "${IMAGE_RUNS_AS_ROOT}" = 0 ] && ! docker run --rm "${IMAGE}" \
      python3 -c "import os; os.getxattr('/usr/local/bin/py-spy', b'security.capability')" \
      >/dev/null 2>&1; then
   cat >&2 <<EOF
@@ -232,12 +254,21 @@ if [ -n "${PREV_WORKER}" ]; then
   ./archive_worker_log.sh "${PREV_WORKER}" "${DIAG_DIR}/logs" || true
 fi
 
-echo "Starting SGLang stack for GLM-5.2-FP8 [profile: ${PROFILE}] ..."
+# These used to be hardcoded to GLM-5.2, so PROFILE=flash announced the wrong
+# model and the wrong weight size.
+if [ "${PROFILE}" = "flash" ]; then
+  MODEL_LABEL="GLM-5.3-Flash"
+  LOAD_NOTE="~306 GB of weights; ~6 min measured on this node, warm or cold JIT cache"
+else
+  MODEL_LABEL="GLM-5.2-FP8"
+  LOAD_NOTE="756 GB of weights"
+fi
+echo "Starting SGLang stack for ${MODEL_LABEL} [profile: ${PROFILE}] ..."
 docker compose --profile "${PROFILE}" up -d
 
 cat <<EOF
 
-Up. The model load + NSA/MTP warmup takes several minutes (756 GB of weights).
+Up. The model load + MTP warmup takes several minutes (${LOAD_NOTE}).
 
   Follow worker startup:   docker compose -f $(pwd)/docker-compose.yml logs -f ${WORKER_SERVICE}
   Stop everything:         ./stop.sh

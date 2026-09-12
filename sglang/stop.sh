@@ -25,7 +25,7 @@ done
 if docker compose --profile "*" config --services >/dev/null 2>&1; then
   PROFILE_ARGS=(--profile "*")
 else
-  PROFILE_ARGS=(--profile cache --profile longctx)
+  PROFILE_ARGS=(--profile cache --profile longctx --profile flash)
 fi
 
 # LAST CHANCE TO SAVE THE WORKER'S LOG -- and the likelier of the two, since
@@ -36,10 +36,14 @@ fi
 # destroys the sole evidence of why, which is exactly how the 2026-09-03
 # exit-137 hang ended up un-diagnosable. See archive_worker_log.sh.
 #
-# Both worker services are tried because stop.sh tears down every profile; only
-# one of them normally exists. DIAG_DIR matches serve.sh's default.
+# Every worker service is tried because stop.sh tears down every profile; only
+# one normally exists. The list is DERIVED from the compose file, not
+# hardcoded: it used to read `for svc in worker worker-longctx`, so when
+# worker-flash was added its log was silently never archived -- every
+# ./stop.sh on PROFILE=flash deleted the only copy. Deriving it means a future
+# worker cannot fall through the same gap. DIAG_DIR matches serve.sh's default.
 DIAG_DIR="$(realpath -m "${DIAG_DIR:-/scratch/diag}")"
-for svc in worker worker-longctx; do
+for svc in $(docker compose "${PROFILE_ARGS[@]}" config --services 2>/dev/null); do
   cid="$(docker compose "${PROFILE_ARGS[@]}" ps -aq "${svc}" 2>/dev/null | head -n1 || true)"
   if [ -n "${cid}" ]; then
     ./archive_worker_log.sh "${cid}" "${DIAG_DIR}/logs" || true

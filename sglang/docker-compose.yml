@@ -87,8 +87,26 @@ x-worker-base: &worker-base
   # reported "PID ... is zombie and can not be killed", `docker restart` failed
   # outright leaving the worker DOWN, and `docker compose up -d worker` refused
   # to recreate it -- all needing a manual `docker kill` first. docker-init as
-  # pid 1 forwards signals and reaps, and that symptom is gone: stop and
-  # recreate now complete unaided (verified 2026-08-31/09-01).
+  # pid 1 forwards signals and reaps, and THAT symptom is gone: the container
+  # is no longer unkillable and no manual `docker kill` is needed.
+  #
+  # Teardown is still NOT clean on GLM-5.2, though, and an earlier version of
+  # this comment wrongly said "stop and recreate now complete unaided".
+  # Observed 3/3 on 2026-09-11/12 (the Dynamo cutover, a metrics restart, the
+  # handover to GLM-5.3-Flash): `docker compose down` fails after ~24 s with
+  #   cannot stop container: ... tried to kill container, but did not
+  #   receive an exit event
+  # and does NOT remove the container. It stays `running` with every scheduler
+  # already a zombie and the GPUs already released, then settles to Exited
+  # (137) within seconds. ./stop.sh runs under `set -e`, so it exits non-zero
+  # right there, before printing "SGLang stack stopped." Running
+  # `docker compose down` a second time completes it. Expect this -- it is the
+  # same event as the 137 teardown described next, not a new fault.
+  #
+  # GLM-5.3-Flash WITHOUT HiCache tore down cleanly (1/1), which fits the
+  # pinned-host-pool hypothesis below (~0 GB pinned there vs ~920 GB on
+  # GLM-5.2). GLM-5.3-Flash WITH HiCache (~256 GB pinned) is unobserved: the
+  # restarts that ran with it discarded their output.
   #
   # It does NOT stop the exit-137 teardown, and cannot. Measured on a fully
   # loaded worker 2026-09-01: SIGTERM 01:41:51 -> engine shutdown complete

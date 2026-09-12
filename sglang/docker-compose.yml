@@ -499,6 +499,14 @@ services:
       # TOOL_PARSER when that lands.
       - --tool-call-parser=${TOOL_PARSER:-glm47}
       - --reasoning-parser=${REASONING_PARSER:-glm45}
+      # The checkpoint's own generation_config.json specifies temperature 1.0 /
+      # top_p 0.95, and upstream's GSM8K recipe for this model uses the same.
+      # Without this flag the engine does NOT pick them up: /get_model_info
+      # reported preferred_sampling_params=null, so any client that omits
+      # temperature/top_p silently got engine defaults instead of the values
+      # the model was tuned for. Setting it both applies them as defaults and
+      # advertises them to clients via /get_model_info.
+      - '--preferred-sampling-params={"temperature":1.0,"top_p":0.95}'
       # Not in the upstream cell, kept from our stack: without it
       # usage.prompt_tokens_details.cached_tokens silently disappears and
       # bench_stream.py loses its direct prefix-cache-hit count.

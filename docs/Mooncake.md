@@ -5,15 +5,46 @@ Recorded 2026-09-11, when GLM-5.3-Flash was brought up with a tiered KV cache.
 
 ## What Mooncake is
 
-Mooncake is an open-source **disaggregated KV cache store**, built originally for
-Moonshot AI's Kimi service. It pools DRAM and SSD from *many* machines into a
-single logical KV cache and moves pages between them over RDMA, so a prefix
-computed on one worker can be reused by a different worker on a different node.
+Mooncake is the open-source (Apache-2.0) serving platform behind **Kimi**
+(Moonshot AI): <https://github.com/kvcache-ai/Mooncake>. The design is
+published as *"Mooncake: A KVCache-centric Disaggregated Architecture for LLM
+Serving"* (FAST '25, <https://www.usenix.org/system/files/fast25-qin.pdf>).
+Moonshot report it lets Kimi serve **75% more requests** under SLO on real
+workloads. It joined the **PyTorch Ecosystem** in February 2026.
 
-In SGLang it shows up as one of the choices for `--hicache-storage-backend`,
-i.e. the **L3** tier underneath the GPU radix cache (L1) and the host-RAM
-tier (L2). Selecting it also requires a Mooncake service running on every
-serving node plus a config file, pointed at by
+The core idea: conventional serving ties the KV cache to whichever worker
+computed it, so when that worker is busy or restarts the cache is stranded.
+Mooncake makes the KV cache a first-class *disaggregated* resource — pool DRAM
+and SSD across many machines into one logical store, move pages over **RDMA**
+(zero-copy), and let any worker reuse a prefix that any other worker computed.
+
+Two components recur in integrations:
+
+- **Transfer Engine** — the RDMA data path; the piece most projects adopt first.
+- **Mooncake Store** — the distributed KV cache pool built on top of it.
+
+It is not SGLang-specific, and describing it as merely "SGLang's L3 option"
+undersells it. Current adoption:
+
+| Project | Use |
+|---|---|
+| vLLM | Mooncake Store officially featured (2026-05); Transfer Engine as a v1 KV Connector |
+| SGLang | HiCache storage backend (2025-09); EPD disaggregation transfer backend; RDMA P2P weight transfer for RL |
+| TensorRT-LLM | KVCache transfer for PD-disaggregated inference |
+| PyTorch | Ecosystem project |
+
+For scale: SGLang used the Transfer Engine for P2P weight transfer on
+**Kimi-K2 (1T parameters)** across thousands of GPUs, cutting weight updates
+from **53s to 7.2s**.
+
+In SGLang it is one choice for `--hicache-storage-backend`, i.e. the **L3**
+tier underneath the GPU radix cache (L1) and the host-RAM tier (L2).
+
+**The library is already present in our image** —
+`/opt/sglang/lib/python3.12/site-packages/mooncake/` ships `engine.so`,
+`async_store.py`, `http_metadata_server.py` and friends. What adopting it
+would actually cost is not a pip install: it is a **running Mooncake service
+and a config file on every serving node**, pointed at by
 `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`.
 
 ## Why upstream lists it for GLM-5.3-Flash
@@ -102,7 +133,29 @@ configuration against the no-HiCache baseline before assuming it helps.**
 
 ## When to revisit Mooncake
 
-Only if this grows to **two or more nodes**. At that point cross-node prefix
-sharing becomes reachable, and Mooncake — alongside reintroducing an
-orchestration layer for KV-aware routing and disaggregated prefill/decode —
-starts to pay. On one node, it does not.
+Every capability above concerns moving KV **between machines or between
+roles** — prefill<->decode, encoder<->language model, inference<->training.
+This node has one aggregated worker at TP=8, so there is no second party to
+transfer to. That is the whole argument, and it is topological, not a
+judgement about Mooncake's quality.
+
+Three concrete triggers would change it:
+
+1. **A second node.** Cross-node prefix sharing becomes reachable. This is the
+   main one, and it is the same threshold that would justify reintroducing an
+   orchestration layer for KV-aware routing.
+
+2. **Disaggregated prefill/decode.** `sglang/README.md` already records that
+   this needs >= 2 nodes, since each worker holds a full model copy.
+
+3. **Heavy multimodal traffic — relevant to THIS model specifically.**
+   GLM-5.3-Flash is natively multimodal with a 24-layer vision encoder, and
+   SGLang's Encode-Prefill-Decode (EPD) disaggregation uses Mooncake as the
+   transfer backend to move ViT embeddings off the language-model node
+   (merged 2025-12; a Mooncake-powered global multimodal embedding cache for
+   cross-instance ViT embedding reuse followed in 2026-02). Upstream's
+   GLM-5.3-Flash cookbook separately suggests encoder disaggregation for very
+   long video on 4x GB300. We serve no image or video traffic today, so this
+   is dormant — but unlike (1) and (2) it is specific to the model we are
+   actually running, and would arrive with the workload rather than with new
+   hardware.

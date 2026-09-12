@@ -1,10 +1,52 @@
-# Context Window: Why 1M Isn't Enabled
+# Context Window
 
-The GLM-5.2-FP8 model supports a **1M token** max context natively, but this
+| Model | Profile | Served context | Status |
+|---|---|---|---|
+| **GLM-5.3-Flash** | `flash` | **1,048,576 (1M)** | **serving, verified 2026-09-12** |
+| GLM-5.2-FP8 | `cache` | 524,288 (512K) | serving |
+| GLM-5.2-FP8 | `longctx` | 1,048,576 (configured) | never served a request |
+
+## GLM-5.3-Flash serves the full 1M (2026-09-12)
+
+The single-node 1M barrier that the rest of this document is about **does not
+apply to GLM-5.3-Flash**. Nothing was fixed; the architecture is different.
+GLM-5.2 is 78 layers of DSA attention, all of which hold a paged KV cache.
+GLM-5.3-Flash is 45 layers of which only **11** are DSA -- the other 34 are KDA
+linear-attention layers carrying fixed-size recurrent state -- and the
+checkpoint is ~306 GB rather than ~756 GB. On the same 8 H200s:
+
+| | GLM-5.2-FP8 | GLM-5.3-Flash |
+|---|---|---|
+| KV pool (`max_total_num_tokens`) | 540,928 | **3,687,104** |
+| A single 1M-token request | **does not fit** (pool < request) | fits, ~3.5x headroom |
+| Served context | 524,288 | **1,048,576** |
+
+Verified end-to-end, not merely configured: **999,256 tokens** prefilled with a
+needle planted at 10% depth and recalled correctly (~49 s), reproduced at
+999,915 and 999,483. See `sglang/RESULTS-glm53-longctx.md` for the runs, the two
+harness bugs that nearly produced a false pass, and the scope limits (it is a
+retrieval check, not a reasoning-at-depth check).
+
+`PROFILE=flash` pins no `--context-length`, so the engine takes the checkpoint
+maximum (`max_position_embeddings: 1048576`, `rope_scaling: None` -- native 1M,
+not RoPE-extended).
+
+**Concurrency trades directly against context.** ~1M per request against a
+3,687,104-token pool is roughly **3 concurrent full-length requests**;
+`--max-running-requests=128` does not change that. ~18 at 200K, ~36 at 100K.
+
+---
+
+# Everything below is about GLM-5.2-FP8
+
+Retained as the record of why 1M was unreachable for **that** model on this
+hardware. It remains accurate for `PROFILE=cache` and `PROFILE=longctx`.
+
+The GLM-5.2-FP8 model supports a **1M token** max context natively, but that
 deployment serves **512K** (`--context-length 524288`) as its default profile
 (`PROFILE=cache`).
 
-## Why not 1M on a single node
+## Why not 1M on a single node (GLM-5.2)
 
 - Hardware: 8× H200 on a single node, TP=8.
 - The KV cache pool tops out at **~541K tokens** alongside the ~756 GB of FP8
@@ -117,6 +159,8 @@ measurement.
   works.
 
 ## Current settings
+
+(GLM-5.2 profiles only; for GLM-5.3-Flash see the top of this document.)
 
 | Setting | Profile A (`cache`, default) | Profile B (`longctx`) |
 |---|---|---|

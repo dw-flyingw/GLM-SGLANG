@@ -21,18 +21,43 @@ OUT = os.path.join(HERE, "RESULTS-glm53-longctx.md")
 URL = "http://127.0.0.1:8000/v1/chat/completions"
 MODEL = "glm-5.3-flash"
 NEEDLE = "MAGENTA-7731"
-# ~3.6 chars/token for this filler; corrected against reported prompt_tokens.
-FILLER = ("The quarterly logistics report notes routine depot activity and "
-          "no exceptions worth escalating to the regional coordinator. ")
+# Filler must be HETEROGENEOUS. A first version repeated one identical
+# sentence; at 523,829 tokens the model then FAILED to find the needle (twice,
+# burning a full 4096-token budget), while succeeding at 999,483. That is not a
+# context-length limit -- it is what a degenerate input does to DSA sparse
+# attention, whose indexer selects top-k blocks by relevance and has nothing to
+# discriminate on when every block is byte-identical. With varied records below,
+# both 512K and ~1M answer directly in <90 completion tokens.
+#
+# Chars-per-token is CALIBRATED at runtime, never assumed: the first version
+# hardcoded 3.6 and every length silently landed at ~52% of target, so a "1M"
+# run was really 548,006 tokens. Numeric-dense text here measures ~2.97.
+NOUNS = ["depot", "warehouse", "terminal", "hub", "yard", "dock", "station", "annex"]
+VERBS = ["recorded", "logged", "reported", "flagged", "noted", "registered", "filed", "posted"]
 
-def build(target_tokens):
-    approx_chars = int(target_tokens * 3.6)
-    reps = max(1, approx_chars // len(FILLER))
-    body = FILLER * reps
-    cut = len(body) // 10
-    return (body[:cut]
+def _body(nchars, rng):
+    parts, tot = [], 0
+    while tot < nchars:
+        s = (f"Record {rng.randint(10000,99999)}: the {rng.choice(NOUNS)} "
+             f"{rng.choice(VERBS)} {rng.randint(100,9999)} units on shift "
+             f"{rng.randint(1,4)} with variance {rng.random():.3f}. ")
+        parts.append(s); tot += len(s)
+    return "".join(parts)
+
+def calibrate():
+    """Measure chars/token against the live server rather than assuming it."""
+    import random
+    probe = _body(200_000, random.Random(7))
+    usage, _, _ = ask(probe, max_tokens=8)
+    return len(probe) / usage["prompt_tokens"]
+
+def build(target_tokens, cpt):
+    import random
+    b = _body(int(target_tokens * cpt), random.Random(7))
+    cut = len(b) // 10
+    return (b[:cut]
             + f"\n\nIMPORTANT RECORD: The secret code is {NEEDLE}. Remember it.\n\n"
-            + body[cut:])
+            + b[cut:])
 
 def ask(prompt, max_tokens=64, timeout=1800):
     req = urllib.request.Request(
@@ -54,18 +79,21 @@ def ask(prompt, max_tokens=64, timeout=1800):
     return d["usage"], text, el
 
 def main():
-    targets = [int(x) for x in (sys.argv[1:] or [131072, 524288, 1048576])]
+    targets = [int(x) for x in (sys.argv[1:] or [131072, 524288, 1000000])]
+    cpt = calibrate()
+    print(f"calibrated: {cpt:.3f} chars/token", flush=True)
     with open(OUT, "w") as f:
         f.write(f"# GLM-5.3-Flash long-context verification\n\n")
         f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}\n\n")
         f.write("Needle test: a unique code is planted at ~10% depth and recalled at the end.\n")
         f.write("A non-erroring response only proves no crash; the needle proves the context was read.\n\n")
+        f.write(f"Calibrated at {cpt:.3f} chars/token against the live server.\n\n")
         f.write("| target | actual prompt_tokens | elapsed | needle found | verdict |\n|---|---|---|---|---|\n")
     for t in targets:
         label = f"{t//1024}K"
         print(f"=== {label} ===", flush=True)
         try:
-            usage, text, el = ask(build(t))
+            usage, text, el = ask(build(t, cpt), max_tokens=2048)
             found = NEEDLE in text
             row = (f"| {label} | {usage['prompt_tokens']:,} | {el:.1f}s | "
                    f"{'YES' if found else 'NO'} | {'PASS' if found else 'RESPONDED BUT NEEDLE MISSED'} |")

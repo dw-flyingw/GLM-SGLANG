@@ -1,9 +1,10 @@
 # HiCache on GLM-5.3-Flash: read this before trusting the benchmark
 
-**Short version: `sglang/RESULTS-glm53-hicache-ab.md` shows HiCache costing ~38%
-of sustained throughput. That number does NOT apply to this deployment's actual
-workload, and HiCache should stay ON. Do not turn it off on the strength of that
-file alone.**
+**Short version: HiCache stays ON. `sglang/RESULTS-glm53-hicache-ab.md` does not
+show otherwise -- its concurrency-32 numbers are bimodal and its summary ranges
+overlap -- and an earlier partial reading of it that suggested a ~38% throughput
+cost is withdrawn. Even taken at face value, that benchmark does not model this
+deployment's workload. Do not turn HiCache off on the strength of that file.**
 
 Recorded 2026-09-12, after the A/B was run and its scope understood.
 
@@ -69,21 +70,33 @@ Two further properties of these loops that the benchmark cannot reproduce:
 
 ## What the benchmark IS good for
 
-Two findings from it do transfer, because they are not workload-dependent:
+What does and does not transfer from it:
 
-- **`--hicache-write-policy write_through_selective`, never plain
-  `write_through`.** Plain write_through collapsed concurrency-1 throughput to
-  109 tok/s vs 207-247 for every other config, with ITL p99 98.7 ms vs ~13 ms.
-  That is synchronous per-page writes stalling decode, and it is a property of
-  the write path, not of the prefix distribution.
-- **The L3 tier survives a worker restart.** The `on-warm` arm recovered
-  cold-start throughput markedly over `on-cold` (rep1: 653.7 vs 475.3 tok/s at
-  concurrency 32, pass 1). Restarts are frequent enough here to matter.
+- **Write policy: no measurable difference on GLM-5.3-Flash, so keep the
+  engine default `write_through`.** This bullet once said "write_through_selective,
+  never plain write_through", on the strength of one run in which plain
+  write_through gave 109 tok/s at concurrency 1 (ITL p99 98.7 ms). A repeated,
+  interleaved comparison with the L3 tier cleared before every arm
+  (`sglang/RESULTS-glm53-writepolicy.md`, 3 reps each) did not reproduce it.
+  Pass 2, concurrency 1: `write_through` 228.5-241.0 tok/s (ITL p99 13.7-14.4
+  ms) vs `write_through_selective` 229.2-236.5 tok/s (ITL p99 13.1-14.1 ms) --
+  the selective range sits entirely inside the write_through range. That agrees
+  with `sglang/RESULTS-kv-tiering.md` Task 5b on GLM-5.2, which also found
+  selective no better and recommended against it. The 109 tok/s figure was a
+  slow-mode sample from a benchmark later shown to be bimodal.
+- **The L3 tier survives a worker restart** -- by design, which is the point of
+  a disk tier. The throughput benefit of that on GLM-5.3-Flash is NOT
+  established by this benchmark: an earlier note here cited rep 1 alone (653.7
+  vs 475.3 tok/s, conc-32 pass 1), but over three reps `on-warm` was 681+/-46
+  and `on-cold` 592+/-91, overlapping. Restarts are frequent enough here that it
+  is worth measuring on real traffic.
 
-It also established that the measurement noise in the FIRST sweep
-(`RESULTS-glm53-sweep.md`, ~24% between identical configs) was caused by the L3
-directory accumulating across runs, not by inherent variance. With `/scratch`
-cleared between arms, repeated runs of the same config land within ~2%.
+It also showed that clearing `/scratch` between arms removes one confound but
+NOT the bimodality: the `off` arm alone returned 1506.8, 1537.1 and 911.8 tok/s
+at concurrency 32. An earlier note here that repeated runs "land within ~2%" was
+drawn from the first two of those three and is withdrawn. Concurrency 1 was the
+exception, holding to 214-243 tok/s across all nine runs -- which is why the
+write-policy question was re-measured at concurrency 1 only (no difference; see above).
 
 ## How to settle this properly
 

@@ -103,10 +103,12 @@ x-worker-base: &worker-base
   # `docker compose down` a second time completes it. Expect this -- it is the
   # same event as the 137 teardown described next, not a new fault.
   #
-  # GLM-5.3-Flash WITHOUT HiCache tore down cleanly (1/1), which fits the
-  # pinned-host-pool hypothesis below (~0 GB pinned there vs ~920 GB on
-  # GLM-5.2). GLM-5.3-Flash WITH HiCache (~256 GB pinned) is unobserved: the
-  # restarts that ran with it discarded their output.
+  # GLM-5.3-Flash tears down cleanly: 1/1 without HiCache and 6/6 with it
+  # (hicache-size 32 GB/rank, so at least ~256 GB pinned), the latter
+  # recorded in RESULTS-glm53-writepolicy.md -- the first `down` succeeded
+  # and the log was archived every time. That fits the pinned-host-pool
+  # hypothesis below (~920 GB pinned on GLM-5.2) but does not prove it: the
+  # two models differ in more than pool size.
   #
   # It does NOT stop the exit-137 teardown, and cannot. Measured on a fully
   # loaded worker 2026-09-01: SIGTERM 01:41:51 -> engine shutdown complete
@@ -555,7 +557,9 @@ services:
       # "Not Verified" for this model (see sgl-project/sglang#38474).
       #
       # DO NOT turn this off on the strength of RESULTS-glm53-hicache-ab.md.
-      # That A/B shows HiCache costing ~38% of sustained throughput, but it
+      # That A/B does not even resolve on-vs-off at concurrency 32 (pass-2
+      # off 1319+/-313 vs on-warm 934+/-9 tok/s: the ranges overlap), and
+      # in any case it
       # drives ONE 2000-token shared prefix, which the 3.5M-token GPU radix
       # cache absorbs entirely (97.8% hit) -- so the host/disk tiers take
       # every write and serve no recall the GPU tier would not have served.
@@ -576,13 +580,17 @@ services:
       # write_through writes EVERY page to host and /scratch synchronously.
       # Measured on GLM-5.2: ~8.7% system throughput cost at concurrency 32.
       # write_through_selective writes only hotter pages. Override to A/B.
-      # write_through_selective, NOT write_through. Measured 2026-09-12: plain
-      # write_through collapsed concurrency-1 throughput to 109 tok/s vs
-      # 207-247 for every other config, with ITL p99 98.7 ms vs ~13 ms -- the
-      # signature of synchronous per-page writes stalling decode. That gap was
-      # the ONLY throughput difference in the sweep large enough to clear its
-      # ~24% noise floor. Do not revert to write_through without re-measuring.
-      - --hicache-write-policy=${HICACHE_WRITE_POLICY:-write_through_selective}
+      # write_through, the engine default. write_through_selective was briefly
+      # the default here, adopted on ONE sweep run where plain write_through
+      # gave 109 tok/s at concurrency 1 vs 207-247 for every other config. An
+      # interleaved re-test with L3 cleared before every arm did not reproduce
+      # it (RESULTS-glm53-writepolicy.md, 3 reps each, pass 2, conc 1):
+      #     write_through            228.5-241.0 tok/s, ITL p99 13.7-14.4 ms
+      #     write_through_selective  229.2-236.5 tok/s, ITL p99 13.1-14.1 ms
+      # No measurable difference; the 109 was a slow-mode sample. That matches
+      # RESULTS-kv-tiering.md Task 5b on GLM-5.2, which also found selective
+      # no better and recommended against it. So: one fewer non-default knob.
+      - --hicache-write-policy=${HICACHE_WRITE_POLICY:-write_through}
       # `kernel` I/O is downgraded to `direct` only when the effective DECODE
       # backend is fa3; ours is tilelang. VERIFIED 2026-09-12: no downgrade in
       # any of the 5 sweep runs (io_backend_downgraded False throughout).
